@@ -35,6 +35,12 @@ export default defineConfig({
   resolve: {
     alias: [
       {
+        find: "@",
+        replacement: fileURLToPath(
+          new URL("./src", import.meta.url)
+        ),
+      },
+      {
         find: "declarations",
         replacement: fileURLToPath(
           new URL("../declarations", import.meta.url)
