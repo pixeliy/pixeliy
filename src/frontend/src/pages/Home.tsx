@@ -99,7 +99,7 @@ export default function PixeliyLanding() {
                         whileHover={{ scale: 1.05 }}
                         transition={{ type: "spring", stiffness: 400, damping: 17 }}
                     >
-                        <h1 className="font-logo text-2xl font-bold text-lime-400 m-0">
+                        <h1 className="font-logo text-2xl text-lime-400 m-0">
                             PIXELIY
                         </h1>
                     </motion.div>
