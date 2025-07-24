@@ -1,11 +1,35 @@
-import React, { useState, useEffect, useRef } from 'react';
+"use client"
+
+import React, { useState, useRef, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import { Principal } from '@dfinity/principal';
+import { InteractiveGridPattern } from '@/components/ui/interactive-grid';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
+import {
+    Video, VideoOff, Mic, MicOff, Settings,
+    PhoneOff, Copy, Users, User, Globe, Shield,
+    Activity, Camera, AlertTriangle, EyeOff,
+    Languages, MessageSquare, Mic2, Volume2,
+    ChevronDown, Pause, Play,
+    Trash
+} from 'lucide-react';
+import TargetCursor from '../components/target-cursor';
 import { useAuth } from '../contexts/AuthContext';
 import { useRoom } from '../hooks/useRoom';
 import { useRealTimeRoom } from '../hooks/useRealTimeRoom';
+import { useTranslation } from '../hooks/useTranslation';
+import LoginRequired from '../components/auth/LoginRequired';
+import ProfileSetupRequired from '../components/auth/ProfileSetupRequired';
 import { Signal } from '../types/backend';
+
+// Animation variants 
+const smoothTransition = {
+    duration: 0.8,
+    ease: "easeOut" as const,
+};
 
 interface PeerConnectionData {
     pc: RTCPeerConnection;
@@ -16,6 +40,26 @@ interface PeerConnectionData {
     hasLocalDescription: boolean;
     isOfferer: boolean;
     isAnswerer: boolean;
+}
+
+interface SpeechLog {
+    id: string;
+    participantId: string;
+    participantName: string;
+    originalText: string;
+    translatedText?: string;
+    detectedLanguage?: string;
+    timestamp: Date;
+    isTranslating: boolean;
+    isLocal: boolean;
+    confidence?: number;
+}
+
+declare global {
+    interface Window {
+        SpeechRecognition: any;
+        webkitSpeechRecognition: any;
+    }
 }
 
 const Room: React.FC = () => {
@@ -51,6 +95,13 @@ const Room: React.FC = () => {
         stopPolling
     } = useRealTimeRoom(roomId, principalId);
 
+    const {
+        translate,
+        detectLanguage,
+        isLoading: translationLoading,
+        supportedLanguages
+    } = useTranslation();
+
     // ========== WEBRTC REFS ==========
     const localStream = useRef<MediaStream | null>(null);
     const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -60,6 +111,10 @@ const Room: React.FC = () => {
     const remoteVideosContainerRef = useRef<HTMLDivElement>(null);
     const processedSignals = useRef<Set<string>>(new Set());
     const previousParticipants = useRef<string[]>([]);
+
+    // ========== SPEECH RECOGNITION REFS ==========
+    const speechRecognitionRef = useRef<any>(null);
+    const shouldRestartSpeechRef = useRef(false);
 
     // ========== STATES ==========
     const [isSignalPolling, setIsSignalPolling] = useState(false);
@@ -80,6 +135,17 @@ const Room: React.FC = () => {
     const [isMicrophoneEnabled, setIsMicrophoneEnabled] = useState(true);
     const [isDevicesLoading, setIsDevicesLoading] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
+
+    // ========== UI STATES ==========
+    const [showParticipants, setShowParticipants] = useState(false);
+    const [showAITranslate, setShowAITranslate] = useState(false);
+
+    // ========== AI TRANSLATION STATES ==========
+    const [isTranscribing, setIsTranscribing] = useState(false);
+    const [sourceLanguage, setSourceLanguage] = useState('id-ID');
+    const [targetLanguage, setTargetLanguage] = useState('en-US');
+    const [speechLogs, setSpeechLogs] = useState<SpeechLog[]>([]);
+    const [recognitionActive, setRecognitionActive] = useState(false);
 
     // ========== COMPUTED VALUES ==========
     const isUserReady = isAuthenticated && user?.username;
@@ -117,6 +183,189 @@ const Room: React.FC = () => {
         } catch (error) {
             console.error('[AUTO-WEBRTC] Initialization failed:', error);
         }
+    };
+
+    // ========== AI TRANSLATION FUNCTIONS ==========
+    const initializeSpeechRecognition = () => {
+        if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+            console.warn('Speech Recognition not supported');
+            return;
+        }
+
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const recognition = new SpeechRecognition();
+
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = sourceLanguage;
+        recognition.maxAlternatives = 1;
+
+        recognition.onstart = () => {
+            setRecognitionActive(true);
+        };
+
+        recognition.onend = () => {
+            setRecognitionActive(false);
+            if (shouldRestartSpeechRef.current && showAITranslate) {
+                setIsTranscribing(true);
+                if (shouldRestartSpeechRef.current && speechRecognitionRef.current) {
+                    try {
+                        speechRecognitionRef.current.start();
+                    } catch (error) {
+                        console.error('[AI-TRANSLATE] Restart failed:', error);
+                    }
+                }
+            } else {
+                setIsTranscribing(false);
+            }
+        };
+
+        recognition.onerror = (event: any) => {
+            console.error('[AI-TRANSLATE] Speech recognition error:', event.error);
+            setRecognitionActive(false);
+        };
+
+        recognition.onresult = async (event: any) => {
+            let finalTranscript = '';
+
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const result = event.results[i];
+
+                if (result.isFinal) {
+                    finalTranscript += result[0].transcript;
+                    const confidence = result[0].confidence;
+
+                    if (finalTranscript.trim()) {
+                        await handleSpeechResult(
+                            finalTranscript.trim(),
+                            principalId || 'local',
+                            user?.name || user?.username || 'You',
+                            true,
+                            confidence
+                        );
+                    }
+                }
+            }
+        };
+
+        speechRecognitionRef.current = recognition;
+    };
+
+    const handleSpeechResult = async (
+        text: string,
+        participantId: string,
+        participantName: string,
+        isLocal: boolean,
+        confidence?: number
+    ) => {
+        const logId = `${participantId}-${Date.now()}-${Math.random()}`;
+
+        // Create initial log entry
+        const newLog: SpeechLog = {
+            id: logId,
+            participantId,
+            participantName,
+            originalText: text,
+            timestamp: new Date(),
+            isTranslating: true,
+            isLocal,
+            confidence
+        };
+
+        setSpeechLogs(prev => [newLog, ...prev]);
+
+        try {
+            // Detect language
+            const detectedLang = await detectLanguage(text);
+
+            // Translate to target language
+            const translatedText = await translate(text, targetLanguage);
+
+            // Update log with translation
+            setSpeechLogs(prev => prev.map(log =>
+                log.id === logId
+                    ? {
+                        ...log,
+                        translatedText,
+                        detectedLanguage: detectedLang,
+                        isTranslating: false
+                    }
+                    : log
+            ));
+
+            console.log('[AI-TRANSLATE] Translation completed:', {
+                original: text,
+                translated: translatedText,
+                language: detectedLang
+            });
+
+        } catch (error) {
+            console.error('[AI-TRANSLATE] Translation failed:', error);
+
+            // Update log with error
+            setSpeechLogs(prev => prev.map(log =>
+                log.id === logId
+                    ? {
+                        ...log,
+                        translatedText: 'Translation failed',
+                        isTranslating: false
+                    }
+                    : log
+            ));
+        }
+    };
+
+    const startAITranscription = () => {
+        if (!speechRecognitionRef.current) {
+            initializeSpeechRecognition();
+        }
+
+        if (speechRecognitionRef.current && !recognitionActive) {
+            try {
+                shouldRestartSpeechRef.current = true;
+                speechRecognitionRef.current.start();
+                setIsTranscribing(true);
+                console.log('[AI-TRANSLATE] Starting transcription...');
+            } catch (error) {
+                console.error('[AI-TRANSLATE] Failed to start:', error);
+            }
+        }
+    };
+
+    const stopAITranscription = () => {
+        if (speechRecognitionRef.current) {
+            shouldRestartSpeechRef.current = false;
+            speechRecognitionRef.current.stop();
+            setIsTranscribing(false);
+        }
+    };
+
+    const clearSpeechLogs = () => {
+        setSpeechLogs([]);
+    };
+
+    const getLanguageName = (code: string): string => {
+        const langMap: Record<string, string> = {
+            'id-ID': '🇮🇩 Indonesian',
+            'en-US': '🇺🇸 English (US)',
+            'en-GB': '🇬🇧 English (UK)',
+            'ja-JP': '🇯🇵 Japanese',
+            'ko-KR': '🇰🇷 Korean',
+            'zh-CN': '🇨🇳 Chinese',
+            'zh-TW': '🇹🇼 Chinese (TW)',
+            'es-ES': '🇪🇸 Spanish',
+            'fr-FR': '🇫🇷 French',
+            'de-DE': '🇩🇪 German',
+            'pt-BR': '🇧🇷 Portuguese',
+            'ru-RU': '🇷🇺 Russian',
+            'ar-SA': '🇸🇦 Arabic',
+            'hi-IN': '🇮🇳 Hindi',
+            'th-TH': '🇹🇭 Thai',
+            'vi-VN': '🇻🇳 Vietnamese',
+            'tr-TR': '🇹🇷 Turkish',
+        };
+
+        return langMap[code] || code;
     };
 
     // ========== CLEANUP FUNCTIONS ==========
@@ -172,7 +421,7 @@ const Room: React.FC = () => {
                 peerData.remoteStream.getTracks().forEach(track => track.stop());
             }
 
-            // 🔥 ENHANCED VIDEO ELEMENT REMOVAL
+            // ENHANCED VIDEO ELEMENT REMOVAL
             const videoWrapper = document.getElementById(`video-wrapper-${targetPrincipal}`);
             if (videoWrapper && videoWrapper.parentNode) {
                 videoWrapper.parentNode.removeChild(videoWrapper);
@@ -274,7 +523,7 @@ const Room: React.FC = () => {
                 console.log(`[BIDIRECTIONAL] Peer connection already exists for ${targetPrincipalText}`);
             }
 
-            // 🔥 BIDIRECTIONAL OFFER STRATEGY:
+            // BIDIRECTIONAL OFFER STRATEGY:
             // Both users attempt to connect, but only the one with smaller principal sends offer
             // This ensures EVERY pair of users has a connection
             const shouldIOffer = principalId < targetPrincipalText;
@@ -602,7 +851,7 @@ const Room: React.FC = () => {
                 iceTransportPolicy: 'all'
             });
 
-            // 🔥 CREATE VIDEO ELEMENT BUT DON'T ADD TO DOM YET
+            // CREATE VIDEO ELEMENT BUT DON'T ADD TO DOM YET
             const videoElement = document.createElement('video');
             videoElement.autoplay = true;
             videoElement.playsInline = true;
@@ -610,7 +859,7 @@ const Room: React.FC = () => {
             videoElement.className = 'w-full h-full bg-gray-800 rounded-lg object-cover';
             videoElement.style.aspectRatio = '16/9';
 
-            // 🔥 ENHANCED TRACK HANDLING - DEBUGGING
+            // ENHANCED TRACK HANDLING - DEBUGGING
             pc.ontrack = (event) => {
                 console.log(`[REMOTE] - Track received from ${targetPrincipal}:`);
                 console.log(`[REMOTE] - Track kind: ${event.track.kind}`);
@@ -639,7 +888,7 @@ const Room: React.FC = () => {
                         peerData.remoteStream = remoteStream;
                     }
 
-                    // 🔥 ENHANCED VIDEO PLAY WITH ERROR HANDLING
+                    // ENHANCED VIDEO PLAY WITH ERROR HANDLING
                     videoElement.play()
                         .then(() => {
                             console.log(`[REMOTE] Video playing successfully for ${targetPrincipal}`);
@@ -655,7 +904,7 @@ const Room: React.FC = () => {
                             }, 1000);
                         });
 
-                    // 🔥 ADD VIDEO EVENT LISTENERS FOR DEBUGGING
+                    // ADD VIDEO EVENT LISTENERS FOR DEBUGGING
                     videoElement.onloadedmetadata = () => {
                         console.log(`[REMOTE] Video metadata loaded for ${targetPrincipal}`);
                         console.log(`[REMOTE] - Video dimensions: ${videoElement.videoWidth}x${videoElement.videoHeight}`);
@@ -672,9 +921,48 @@ const Room: React.FC = () => {
                 } else {
                     console.warn(`[REMOTE] No remote stream in track event from ${targetPrincipal}`);
                 }
+
+                // Enhanced remote audio monitoring for AI translation
+                if (event.track.kind === 'audio' && showAITranslate) {
+                    try {
+                        const audioContext = new AudioContext();
+                        const source = audioContext.createMediaStreamSource(remoteStream);
+                        const analyser = audioContext.createAnalyser();
+
+                        analyser.fftSize = 256;
+                        source.connect(analyser);
+
+                        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+                        // Simple volume detection for remote speech
+                        const checkAudioLevel = () => {
+                            analyser.getByteFrequencyData(dataArray);
+                            const average = dataArray.reduce((sum, value) => sum + value) / dataArray.length;
+
+                            if (average > 30) { // Threshold for speech detection
+                                // For now, we'll just log detected speech activity
+                                // handleSpeechResult(
+                                //     '[Remote audio detected - speech-to-text not implemented]',
+                                //     targetPrincipal,
+                                //     `User ${targetPrincipal.substring(0, 8)}...`,
+                                //     false
+                                // );
+                            }
+
+                            if (showAITranslate) {
+                                requestAnimationFrame(checkAudioLevel);
+                            }
+                        };
+
+                        checkAudioLevel();
+
+                    } catch (error) {
+                        console.warn('[AI-TRANSLATE] Audio monitoring setup failed:', error);
+                    }
+                }
             };
 
-            // 🔥 ENHANCED CONNECTION STATE TRACKING - ONLY SHOW VIDEO WHEN CONNECTED
+            // ENHANCED CONNECTION STATE TRACKING - ONLY SHOW VIDEO WHEN CONNECTED
             pc.onconnectionstatechange = () => {
                 console.log(`[PEER] Connection state for ${targetPrincipal}:`, pc.connectionState);
 
@@ -687,32 +975,45 @@ const Room: React.FC = () => {
                     case 'connected':
                         console.log(`[PEER] Successfully connected to ${targetPrincipal}`);
 
-                        // 🔥 ONLY ADD VIDEO ELEMENT TO DOM WHEN CONNECTED - CLEAN DESIGN
+                        // ONLY ADD VIDEO ELEMENT TO DOM WHEN CONNECTED
                         if (remoteVideosContainerRef.current && !document.getElementById(`video-wrapper-${targetPrincipal}`)) {
                             const videoWrapper = document.createElement('div');
-                            videoWrapper.className = 'relative bg-gray-800 rounded-lg overflow-hidden';
+                            videoWrapper.className = 'relative bg-gray-800/50 rounded-xl overflow-hidden border border-gray-600/50 hover:border-lime-400/50 transition-all w-full';
                             videoWrapper.style.aspectRatio = '16/9';
                             videoWrapper.id = `video-wrapper-${targetPrincipal}`;
 
-                            // 🔥 CLEAN USER LABEL - Just first 8 characters
+                            // Apply SpotlightCard effect (optional)
+                            videoWrapper.style.background = 'linear-gradient(145deg, rgba(55, 65, 81, 0.5), rgba(75, 85, 99, 0.5))';
+                            videoWrapper.style.boxShadow = '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)';
+
+                            // Set video element styling
+                            videoElement.className = 'w-full h-full object-cover';
+
+                            // CLEAN USER LABEL
                             const label = document.createElement('div');
-                            label.className = 'absolute bottom-2 left-2 bg-black/70 text-white text-xs px-2 py-1 rounded backdrop-blur-sm';
+                            label.className = 'absolute bottom-3 left-3 bg-black/70 text-white text-xs px-2 py-1 rounded backdrop-blur-sm border border-white/20';
                             label.textContent = `${targetPrincipal.substring(0, 8)}...`;
 
-                            // 🔥 MINIMAL CONNECTION STATUS INDICATOR
+                            // CONNECTION STATUS INDICATOR
                             const statusIndicator = document.createElement('div');
-                            statusIndicator.className = 'absolute top-2 right-2 w-3 h-3 bg-green-400 rounded-full border-2 border-white';
+                            statusIndicator.className = 'absolute top-3 right-3 w-3 h-3 bg-lime-400 rounded-full border-2 border-white animate-pulse';
                             statusIndicator.id = `status-${targetPrincipal}`;
+
+                            // PARTICIPANT BADGE
+                            const participantBadge = document.createElement('div');
+                            participantBadge.className = 'absolute top-3 left-3 bg-lime-500/20 text-lime-300 border border-lime-500/30 text-xs px-2 py-1 rounded backdrop-blur-sm';
+                            participantBadge.innerHTML = '<div class="w-2 h-2 bg-lime-400 rounded-full mr-2 animate-pulse" style="display: inline-block;"></div>Connected';
 
                             videoWrapper.appendChild(videoElement);
                             videoWrapper.appendChild(label);
                             videoWrapper.appendChild(statusIndicator);
+                            videoWrapper.appendChild(participantBadge);
                             remoteVideosContainerRef.current.appendChild(videoWrapper);
 
-                            console.log(`[PEER] Video element added to DOM for ${targetPrincipal}`);
+                            console.log(`[PEER] Video element added to DOM for ${targetPrincipal} with 16:9 aspect ratio`);
                         }
 
-                        // 🔥 VERIFY REMOTE STREAMS AFTER CONNECTION
+                        // VERIFY REMOTE STREAMS AFTER CONNECTION
                         setTimeout(() => {
                             const receivers = pc.getReceivers();
                             console.log(`[PEER] Receivers for ${targetPrincipal}:`, receivers.length);
@@ -750,7 +1051,7 @@ const Room: React.FC = () => {
                     case 'failed':
                         console.log(`[PEER] Connection ${pc.connectionState} for ${targetPrincipal}`);
 
-                        // 🔥 REMOVE VIDEO ELEMENT FROM DOM WHEN DISCONNECTED/FAILED
+                        // REMOVE VIDEO ELEMENT FROM DOM WHEN DISCONNECTED/FAILED
                         const existingWrapper = document.getElementById(`video-wrapper-${targetPrincipal}`);
                         if (existingWrapper && existingWrapper.parentNode) {
                             existingWrapper.parentNode.removeChild(existingWrapper);
@@ -807,7 +1108,7 @@ const Room: React.FC = () => {
                 }
             };
 
-            // 🔥 ENHANCED LOCAL TRACK ADDITION WITH VERIFICATION
+            // ENHANCED LOCAL TRACK ADDITION WITH VERIFICATION
             if (localStream.current) {
                 console.log(`[PEER] Adding local tracks to ${targetPrincipal}...`);
 
@@ -823,7 +1124,7 @@ const Room: React.FC = () => {
                     }
                 });
 
-                // 🔥 VERIFY TRACKS WERE ADDED
+                // VERIFY TRACKS WERE ADDED
                 setTimeout(() => {
                     const senders = pc.getSenders();
                     console.log(`[PEER] Verification - Total senders for ${targetPrincipal}:`, senders.length);
@@ -956,7 +1257,7 @@ const Room: React.FC = () => {
             const peerData = peerConnections.current.get(fromPrincipal);
             if (!peerData || !roomId) return;
 
-            // 🔥 ENHANCED RENEGOTIATION HANDLING
+            // ENHANCED RENEGOTIATION HANDLING
             if (peerData.pc.signalingState === 'stable' && peerData.hasRemoteDescription) {
                 console.log(`[AUTO-OFFER] Handling renegotiation offer from ${fromPrincipal}`);
 
@@ -1253,6 +1554,23 @@ const Room: React.FC = () => {
         }
     };
 
+    // ========== UTILITY FUNCTIONS ==========
+    const copyRoomLink = () => {
+        const roomLink = `${window.location.origin}/room/${roomId}`;
+        navigator.clipboard.writeText(roomLink);
+        // Visual feedback
+        const button = document.activeElement as HTMLButtonElement;
+        if (button) {
+            const originalText = button.textContent;
+            button.textContent = 'Copied!';
+            setTimeout(() => {
+                if (button.textContent === 'Copied!') {
+                    button.textContent = originalText;
+                }
+            }, 2000);
+        }
+    };
+
     const handleLeaveRoom = async () => {
         if (!roomId) return;
 
@@ -1266,7 +1584,6 @@ const Room: React.FC = () => {
             if ('Err' in result) {
                 alert(`Failed to leave room: ${result.Err}`);
             } else {
-                // alert('Left room successfully!');
                 navigate('/dashboard');
             }
         } catch (error) {
@@ -1274,20 +1591,6 @@ const Room: React.FC = () => {
             alert('Failed to leave room');
         } finally {
             setLoading(false);
-        }
-    };
-
-    // ========== UTILITY FUNCTIONS ==========
-    const copyRoomLink = () => {
-        const roomLink = `${window.location.origin}/room/${roomId}`;
-        navigator.clipboard.writeText(roomLink);
-        const button = document.activeElement as HTMLButtonElement;
-        if (button) {
-            const originalText = button.textContent;
-            button.textContent = 'Link Copied!';
-            setTimeout(() => {
-                button.textContent = originalText;
-            }, 2000);
         }
     };
 
@@ -1378,68 +1681,115 @@ const Room: React.FC = () => {
         }
     }, [isUserReady]);
 
+    useEffect(() => {
+        if (showAITranslate && isUserReady) {
+            initializeSpeechRecognition();
+        }
+
+        return () => {
+            shouldRestartSpeechRef.current = false;
+            if (speechRecognitionRef.current) {
+                speechRecognitionRef.current.stop();
+            }
+        };
+    }, [showAITranslate, isUserReady]);
+
+
     // ========== RENDER CONDITIONS ==========
-    if (authLoading || loading) {
+    if (authLoading || loading || roomLoading) {
         return (
             <div className="min-h-screen bg-black flex items-center justify-center">
-                <div className="text-center">
-                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-4"></div>
-                    <div className="text-white text-xl">Loading room...</div>
-                </div>
+                <motion.div
+                    initial={{ opacity: 0, scale: 0.8 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className="text-center"
+                >
+                    <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-lime-400 mx-auto mb-6"></div>
+                    <div className="text-white text-xl">
+                        {loading ? 'Connecting to room...' : 'Loading...'}
+                    </div>
+                    <div className="text-gray-400 text-sm mt-2">
+                        Setting up your video connection
+                    </div>
+                </motion.div>
             </div>
         );
     }
 
     if (!isAuthenticated) {
         return (
-            <div className="min-h-screen bg-black flex items-center justify-center">
-                <div className="text-center">
-                    <h1 className="text-white text-2xl mb-4">Please Login</h1>
-                    <p className="text-gray-400 mb-6">You need to login to access this room</p>
-                    <button
-                        onClick={login}
-                        className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg transition-colors"
-                    >
-                        Login with Internet Identity
-                    </button>
-                </div>
-            </div>
+            <LoginRequired
+                onLogin={login}
+                isLoading={authLoading}
+                title="Join Video Room"
+                subtitle="Authentication Required"
+                description="Please authenticate with Internet Identity to join this video room"
+                showFeatures={false}
+            />
         );
     }
 
+
     if (!user?.username) {
         return (
-            <div className="min-h-screen bg-black flex items-center justify-center">
-                <div className="text-center">
-                    <h1 className="text-white text-2xl mb-4">Registration Required</h1>
-                    <p className="text-gray-400 mb-6">
-                        You need to complete registration before accessing rooms
-                    </p>
-                    <button
-                        onClick={() => navigate('/profile')}
-                        className="bg-green-600 hover:bg-green-700 text-white px-6 py-3 rounded-lg transition-colors"
-                    >
-                        Go to Registration
-                    </button>
-                </div>
-            </div>
+            <ProfileSetupRequired
+                onComplete={() => navigate('/profile')}
+                isLoading={authLoading}
+            />
         );
     }
 
     if (!roomData && !loading && !realtimeLoading) {
         return (
-            <div className="min-h-screen bg-black flex items-center justify-center">
-                <div className="text-center">
-                    <h1 className="text-white text-2xl mb-4">Room Not Found</h1>
-                    <p className="text-gray-400 mb-6">
-                        The room "{roomId}" does not exist or has been closed.
-                    </p>
-                    <button
-                        onClick={() => navigate('/dashboard')}
-                        className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg transition-colors"
+            <div className="min-h-screen bg-black text-white overflow-hidden relative">
+                <TargetCursor targetSelector=".cursor-target" spinDuration={2} hideDefaultCursor={true} />
+
+                <InteractiveGridPattern
+                    className={cn(
+                        "[mask-image:radial-gradient(800px_circle_at_center,white,transparent)]",
+                        "absolute inset-0 h-full w-full z-0",
+                        "fill-red-500/10 stroke-red-500/10"
+                    )}
+                    width={20}
+                    height={20}
+                    squares={[80, 80]}
+                    squaresClassName="hover:fill-red-500/20"
+                />
+
+                <div className="absolute inset-0 z-[1] pointer-events-none">
+                    <div className="absolute inset-0 bg-gradient-to-b from-black/70 via-transparent to-black/50" />
+                    <div className="absolute inset-0 bg-gradient-to-r from-red-500/5 via-transparent to-purple-500/5" />
+                </div>
+
+                <div className="relative z-10 flex items-center justify-center min-h-screen px-4">
+                    <motion.div
+                        initial={{ opacity: 0, scale: 0.9 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        className="text-center max-w-md"
                     >
-                        Back to Dashboard
-                    </button>
+                        <div className="w-20 h-20 bg-red-400/20 rounded-full flex items-center justify-center mx-auto mb-6 border border-red-400/30">
+                            <AlertTriangle className="h-10 w-10 text-red-400" />
+                        </div>
+                        <h1 className="text-3xl font-bold text-white mb-4">Room Not Found</h1>
+                        <p className="text-gray-300 mb-6">
+                            The room "{roomId}" doesn't exist or has been deleted.
+                        </p>
+                        <div className="space-y-3">
+                            <Button
+                                onClick={() => navigate('/dashboard')}
+                                className="w-full bg-lime-400 text-black hover:bg-lime-500 cursor-target"
+                            >
+                                Back to Dashboard
+                            </Button>
+                            <Button
+                                onClick={() => navigate('/')}
+                                variant="outline"
+                                className="w-full border-gray-600 text-gray-300 hover:bg-gray-700 cursor-target"
+                            >
+                                Go Home
+                            </Button>
+                        </div>
+                    </motion.div>
                 </div>
             </div>
         );
@@ -1447,197 +1797,343 @@ const Room: React.FC = () => {
 
     // ========== MAIN RENDER ==========
     return (
-        <div className="min-h-screen bg-gradient-to-br from-gray-900 via-black to-gray-900 text-white">
+        <div className="min-h-screen bg-black text-white overflow-hidden relative">
+            {/* Target Cursor */}
+            <TargetCursor targetSelector=".cursor-target" spinDuration={2} hideDefaultCursor={true} />
+
+            {/* Interactive Grid Background */}
+            <InteractiveGridPattern
+                className={cn(
+                    "[mask-image:radial-gradient(1000px_circle_at_center,white,transparent)]",
+                    "absolute inset-0 h-full w-full z-0",
+                    "fill-lime-500/5 stroke-lime-500/5"
+                )}
+                width={20}
+                height={20}
+                squares={[100, 100]}
+                squaresClassName="hover:fill-lime-500/10"
+            />
+
+            {/* Overlay */}
+            <div className="absolute inset-0 z-[1] pointer-events-none">
+                <div className="absolute inset-0 bg-gradient-to-b from-black/80 via-transparent to-black/80" />
+                <div className="absolute inset-0 bg-gradient-to-r from-lime-500/3 via-transparent to-purple-500/3" />
+            </div>
+
             {/* Header */}
             <motion.header
                 initial={{ opacity: 0, y: -20 }}
                 animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.6 }}
-                className="bg-gray-900/50 backdrop-blur-md border-b border-gray-800 sticky top-0 z-10"
+                transition={smoothTransition}
+                className="fixed top-0 w-full z-50 bg-black/80 backdrop-blur-md border-b border-lime-500/20"
             >
-                <div className="max-w-6xl mx-auto px-6 py-4">
-                    <div className="flex justify-between items-center">
-                        {/* Left: Logo */}
-                        <motion.div
-                            whileHover={{ scale: 1.05 }}
-                            className="flex items-center space-x-3"
+                <div className="container mx-auto px-4 h-16 flex items-center justify-between">
+                    <motion.div
+                        className="flex items-center space-x-4 cursor-target"
+                        whileHover={{ scale: 1.05 }}
+                        transition={{ type: "spring", stiffness: 400, damping: 17 }}
+                    >
+                        <h1 className="font-logo text-2xl text-lime-400 m-0">
+                            PIXELIY
+                        </h1>
+                        <div className="hidden md:block h-6 w-px bg-lime-400/0"></div>
+                        <div className="hidden md:block">
+                            <p className="text-sm text-gray-400">Room</p>
+                            <p className="text-sm font-semibold text-white">{roomId}</p>
+                        </div>
+                    </motion.div>
+
+                    <nav className="hidden lg:flex items-center space-x-6">
+                        <div className="flex items-center space-x-2">
+                            <Users className="w-4 h-4 text-gray-400" />
+                            <span className="text-sm text-gray-400">{participants.length} participants</span>
+                        </div>
+                    </nav>
+
+                    <motion.div
+                        className="flex items-center space-x-3"
+                        initial={{ opacity: 0, x: 20 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ delay: 0.4 }}
+                    >
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            className="border-lime-400/20 text-lime-400 hover:bg-lime-400/10 cursor-target"
+                            onClick={copyRoomLink}
                         >
-                            <span className="text-white font-bold text-lg">Pixeliy Meet</span>
-                        </motion.div>
-
-                        {/* Center: Room Info */}
-                        <div className="text-center">
-                            <h1 className="text-xl font-bold text-white">{roomId}</h1>
-                            <p className="text-gray-400 text-sm">
-                                {connectedPeers.length + 1} participants • {isHost ? '👑 Host' : '👤 Participant'}
-                            </p>
-                        </div>
-
-                        {/* Right: Actions */}
-                        <div className="flex items-center space-x-3">
-                            <motion.button
-                                whileHover={{ scale: 1.05 }}
-                                whileTap={{ scale: 0.95 }}
-                                onClick={copyRoomLink}
-                                className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 px-4 py-2 rounded-xl text-sm font-semibold transition-all"
-                            >
-                                🔗 Copy Link
-                            </motion.button>
-                        </div>
-                    </div>
+                            <Copy className="w-4 h-4 mr-2" />
+                            <span className="hidden md:inline">Copy Link</span>
+                        </Button>
+                        <Button
+                            variant="destructive"
+                            size="sm"
+                            className="cursor-target"
+                            onClick={handleLeaveRoom}
+                        >
+                            <PhoneOff className="w-4 h-4 mr-2" />
+                            <span className="hidden md:inline">Leave</span>
+                        </Button>
+                    </motion.div>
                 </div>
             </motion.header>
 
-            <div className="flex items-center justify-center min-h-[calc(100vh-80px)] px-6">
-                {/* Error Display */}
-                {(authError || roomError || realtimeError) && (
-                    <motion.div
-                        initial={{ opacity: 0, y: -20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="fixed top-24 left-1/2 transform -translate-x-1/2 bg-red-500/20 border border-red-500/50 rounded-xl p-4 z-50 backdrop-blur-md"
-                    >
-                        <p className="text-red-300">
+            {/* Error Display */}
+            {(authError || roomError || realtimeError) && (
+                <motion.div
+                    className="fixed top-20 left-4 right-4 z-40"
+                    initial={{ opacity: 0, y: -20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                >
+                    <div className="max-w-md mx-auto bg-red-500/20 border border-red-500/50 rounded-xl p-4 backdrop-blur-md">
+                        <p className="text-red-300 flex items-center text-sm">
+                            <AlertTriangle className="w-4 h-4 mr-2" />
                             {authError || roomError || realtimeError}
                         </p>
-                    </motion.div>
-                )}
+                    </div>
+                </motion.div>
+            )}
 
-                {/* Room Content */}
+            {/* Main Video Area */}
+            <main className="pt-16 h-screen flex flex-col relative z-10">
                 {roomData && (
                     <motion.div
                         initial={{ opacity: 0, scale: 0.95 }}
                         animate={{ opacity: 1, scale: 1 }}
                         transition={{ duration: 0.6 }}
-                        className="w-full max-w-7xl"
+                        className="flex-1 flex flex-col"
                     >
-                        {/* Video Section */}
-                        <div className="p-4 pb-24">
-                            {/* Dynamic Video Grid */}
-                            {(() => {
-                                const totalVideos = connectedPeers.length + 1;
-                                const { cols, rows } = getVideoGridLayout(totalVideos);
+                        {/* Video Grid Container */}
+                        <div className="flex-1 p-4">
+                            <div className="h-full max-w-7xl mx-auto">
+                                {/* Dynamic Video Grid */}
+                                {(() => {
+                                    const totalVideos = connectedPeers.length + 1; // Include local video
+                                    const { cols, rows } = getVideoGridLayout(totalVideos);
 
-                                return (
-                                    <motion.div
-                                        initial={{ opacity: 0 }}
-                                        animate={{ opacity: 1 }}
-                                        transition={{ delay: 0.3, duration: 0.6 }}
-                                        className="gap-6 w-full"
-                                        style={{
-                                            display: 'grid',
-                                            gridTemplateColumns: `repeat(${cols}, 1fr)`,
-                                            gridTemplateRows: `repeat(${rows}, 1fr)`,
-                                            aspectRatio: totalVideos === 1 ? '16/9' : 'auto'
-                                        }}
-                                    >
-                                        {/* Local Video */}
+                                    const containerHeight = window.innerHeight - 200; // Account for header/controls
+                                    const containerWidth = Math.min(window.innerWidth - 32, 1280); // Max width with padding
+
+                                    const videoWidth = containerWidth / cols;
+
+                                    const aspectRatio = 16 / 9;
+                                    let finalVideoWidth = videoWidth;
+                                    let finalVideoHeight = videoWidth / aspectRatio;
+
+                                    // If height exceeds available space, scale down
+                                    if (finalVideoHeight * rows > containerHeight) {
+                                        finalVideoHeight = containerHeight / rows;
+                                        finalVideoWidth = finalVideoHeight * aspectRatio;
+                                    }
+
+                                    return (
                                         <motion.div
-                                            initial={{ opacity: 0, scale: 0.8 }}
-                                            animate={{ opacity: 1, scale: 1 }}
-                                            transition={{ delay: 0.4, duration: 0.5 }}
-                                            className="relative bg-gradient-to-br from-gray-800 to-gray-900 rounded-2xl overflow-hidden shadow-2xl border border-gray-700/50"
-                                            style={{ aspectRatio: '16/9' }}
+                                            initial={{ opacity: 0 }}
+                                            animate={{ opacity: 1 }}
+                                            transition={{ delay: 0.3, duration: 0.6 }}
+                                            className="gap-4"
+                                            style={{
+                                                display: 'grid',
+                                                gridTemplateColumns: `repeat(${cols}, ${finalVideoWidth}px)`,
+                                                gridTemplateRows: `repeat(${rows}, ${finalVideoHeight}px)`,
+                                                justifyContent: 'center',
+                                                alignContent: 'center',
+                                                width: '100%',
+                                                height: `${containerHeight}px`
+                                            }}
                                         >
-                                            <video
-                                                ref={localVideoRef}
-                                                autoPlay
-                                                muted
-                                                playsInline
-                                                className={`w-full h-full object-cover ${!isCameraEnabled ? 'opacity-30' : ''}`}
-                                            />
+                                            {/* Local Video */}
+                                            <motion.div
+                                                initial={{ opacity: 0, scale: 0.9 }}
+                                                animate={{ opacity: 1, scale: 1 }}
+                                                transition={{ delay: 0.2 }}
+                                                className="relative group w-full"
+                                                style={{ aspectRatio: '16/9' }}
+                                            >
+                                                <div className="relative w-full h-full bg-gray-800/50 rounded-xl overflow-hidden border border-gray-600/50 hover:border-green-400/50 transition-all">
+                                                    {/* Apply consistent gradient background like remote videos */}
+                                                    <div
+                                                        className="absolute inset-0 z-0"
+                                                        style={{
+                                                            background: 'linear-gradient(145deg, rgba(55, 65, 81, 0.5), rgba(75, 85, 99, 0.5))',
+                                                            boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)'
+                                                        }}
+                                                    />
 
-                                            {/* Local Video Overlay */}
-                                            <div className="absolute bottom-3 left-3 bg-black/70 text-white text-xs px-3 py-1 rounded-lg backdrop-blur-sm border border-white/20">
-                                                You
+                                                    <video
+                                                        ref={localVideoRef}
+                                                        autoPlay
+                                                        muted
+                                                        playsInline
+                                                        className="relative z-10 w-full h-full object-cover"
+                                                    />
+
+                                                    {/* Camera Off Overlay */}
+                                                    {!isCameraEnabled && (
+                                                        <motion.div
+                                                            initial={{ opacity: 0 }}
+                                                            animate={{ opacity: 1 }}
+                                                            className="absolute inset-0 z-20 flex items-center justify-center bg-gray-800/90 backdrop-blur-sm"
+                                                        >
+                                                            <div className="text-center text-gray-300">
+                                                                <VideoOff className="w-12 h-12 mx-auto mb-3 text-gray-400" />
+                                                                <div className="text-sm font-medium">Camera off</div>
+                                                            </div>
+                                                        </motion.div>
+                                                    )}
+
+                                                    {/* Top Left - Participant Badge (consistent with remote videos) */}
+                                                    <div className="absolute top-3 left-3 z-30">
+                                                        <div className="bg-green-500/20 text-green-300 border border-green-500/30 text-xs px-2 py-1 rounded backdrop-blur-sm">
+                                                            <div className="w-2 h-2 bg-green-400 rounded-full mr-2 animate-pulse" style={{ display: 'inline-block' }}></div>
+                                                            You
+                                                        </div>
+                                                    </div>
+
+                                                    {/* Top Right - Connection Status & Media Status */}
+                                                    <div className="absolute top-3 right-3 z-30 flex items-center space-x-2">
+                                                        {/* Connection Status Indicator */}
+                                                        <div className="w-3 h-3 bg-green-400 rounded-full border-2 border-white animate-pulse"></div>
+
+                                                        {/* Media Status Icons */}
+                                                        {!isCameraEnabled && (
+                                                            <div className="w-6 h-6 bg-red-500/20 rounded-full flex items-center justify-center border border-red-500/30">
+                                                                <VideoOff className="w-3 h-3 text-red-400" />
+                                                            </div>
+                                                        )}
+                                                        {!isMicrophoneEnabled && (
+                                                            <div className="w-6 h-6 bg-red-500/20 rounded-full flex items-center justify-center border border-red-500/30">
+                                                                <MicOff className="w-3 h-3 text-red-400" />
+                                                            </div>
+                                                        )}
+                                                    </div>
+
+                                                    {/* Bottom Left - User Label (consistent with remote videos) */}
+                                                    <div className="absolute bottom-3 left-3 z-30">
+                                                        <div className="bg-black/70 text-white text-xs px-2 py-1 rounded backdrop-blur-sm border border-white/20">
+                                                            {String(user?.name || '').trim() || String(user?.username || '').trim()}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </motion.div>
+
+                                            {/* Remote Videos Container */}
+                                            <div
+                                                ref={remoteVideosContainerRef}
+                                                className="contents"
+                                            >
+                                                {/* Remote videos will be dynamically added here by WebRTC logic */}
+                                                {/* Each remote video will have style={{ aspectRatio: '16/9' }} applied */}
                                             </div>
 
-                                            {/* Mic Status */}
-                                            <div className="absolute top-3 right-3">
-                                                {!isMicrophoneEnabled && (
-                                                    <motion.div
-                                                        initial={{ scale: 0 }}
-                                                        animate={{ scale: 1 }}
-                                                        className="bg-red-600 text-white text-xs px-2 py-1 rounded-lg shadow-lg"
-                                                    >
-                                                        🔇
-                                                    </motion.div>
-                                                )}
-                                            </div>
-
-                                            {/* Camera Off Overlay */}
-                                            {!isCameraEnabled && (
+                                            {/* Empty Slots for Visual Balance */}
+                                            {Array.from({
+                                                length: Math.max(0, (cols * rows) - totalVideos)
+                                            }).map((_, index) => (
                                                 <motion.div
+                                                    key={`empty-${index}`}
                                                     initial={{ opacity: 0 }}
                                                     animate={{ opacity: 1 }}
-                                                    className="absolute inset-0 flex items-center justify-center bg-gray-800/90 backdrop-blur-sm"
+                                                    transition={{ delay: 0.3 + index * 0.1 }}
+                                                    className="relative group w-full"
+                                                    style={{ aspectRatio: '16/9' }}
                                                 >
-                                                    <div className="text-center text-gray-300">
-                                                        <div className="text-5xl mb-3">📹</div>
-                                                        <div className="text-sm font-medium">Camera off</div>
+                                                    <div className="w-full h-full bg-gray-800/20 border-2 border-dashed border-gray-600/30 rounded-xl flex items-center justify-center">
+                                                        <div className="text-center">
+                                                            <div className="w-8 h-8 bg-gray-600/30 rounded-full flex items-center justify-center mx-auto mb-2">
+                                                                <Users className="w-4 h-4 text-gray-500" />
+                                                            </div>
+                                                            <p className="text-xs text-gray-500">Waiting...</p>
+                                                        </div>
                                                     </div>
                                                 </motion.div>
-                                            )}
+                                            ))}
                                         </motion.div>
-
-                                        {/* Remote Videos Container */}
-                                        <div
-                                            ref={remoteVideosContainerRef}
-                                            className="contents"
-                                        >
-                                        </div>
-                                    </motion.div>
-                                );
-                            })()}
+                                    );
+                                })()}
+                            </div>
                         </div>
 
-                        {/* Media Controls Bar */}
+                        {/* Bottom Controls */}
                         <motion.div
-                            initial={{ opacity: 0, y: 20 }}
+                            initial={{ opacity: 0, y: 50 }}
                             animate={{ opacity: 1, y: 0 }}
-                            transition={{ delay: 0.6, duration: 0.5 }}
-                            className="fixed bottom-6 left-1/2 transform -translate-x-1/2 z-40"
+                            transition={{ delay: 0.4 }}
+                            className="p-4 bg-gradient-to-t from-black/80 to-transparent"
                         >
-                            <div className="bg-gray-900/90 backdrop-blur-md border border-gray-700/50 rounded-2xl px-6 py-4 shadow-2xl">
-                                <div className="flex items-center space-x-4">
+                            <div className="max-w-4xl mx-auto">
+                                <div className="flex items-center justify-center space-x-4">
                                     {/* Camera Toggle */}
                                     <motion.button
-                                        whileHover={{ scale: 1.1 }}
-                                        whileTap={{ scale: 0.9 }}
+                                        whileHover={{ scale: 1.05 }}
+                                        whileTap={{ scale: 0.95 }}
                                         onClick={toggleCamera}
-                                        className={`p-3 rounded-xl transition-all ${isCameraEnabled
-                                                ? 'bg-gray-700/50 hover:bg-gray-600 text-white border border-gray-600'
-                                                : 'bg-red-600 hover:bg-red-700 text-white border border-red-500'
-                                            }`}
-                                        title={isCameraEnabled ? 'Turn off camera' : 'Turn on camera'}
+                                        className={cn(
+                                            "w-12 h-12 rounded-full flex items-center justify-center transition-all cursor-target z-100",
+                                            isCameraEnabled
+                                                ? "bg-gray-700/50 hover:bg-gray-600/50 text-white"
+                                                : "bg-red-500/20 hover:bg-red-500/30 text-red-400"
+                                        )}
                                     >
-                                        <span className="text-xl">📹</span>
+                                        {isCameraEnabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
                                     </motion.button>
 
                                     {/* Microphone Toggle */}
                                     <motion.button
-                                        whileHover={{ scale: 1.1 }}
-                                        whileTap={{ scale: 0.9 }}
+                                        whileHover={{ scale: 1.05 }}
+                                        whileTap={{ scale: 0.95 }}
                                         onClick={toggleMicrophone}
-                                        className={`p-3 rounded-xl transition-all ${isMicrophoneEnabled
-                                                ? 'bg-gray-700/50 hover:bg-gray-600 text-white border border-gray-600'
-                                                : 'bg-red-600 hover:bg-red-700 text-white border border-red-500'
-                                            }`}
-                                        title={isMicrophoneEnabled ? 'Mute microphone' : 'Unmute microphone'}
+                                        className={cn(
+                                            "w-12 h-12 rounded-full flex items-center justify-center transition-all cursor-target z-100",
+                                            isMicrophoneEnabled
+                                                ? "bg-gray-700/50 hover:bg-gray-600/50 text-white"
+                                                : "bg-red-500/20 hover:bg-red-500/30 text-red-400"
+                                        )}
                                     >
-                                        <span className="text-xl">
-                                            {isMicrophoneEnabled ? '🎤' : '🔇'}
-                                        </span>
+                                        {isMicrophoneEnabled ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
                                     </motion.button>
 
                                     {/* Settings */}
                                     <motion.button
-                                        whileHover={{ scale: 1.1 }}
-                                        whileTap={{ scale: 0.9 }}
+                                        whileHover={{ scale: 1.05 }}
+                                        whileTap={{ scale: 0.95 }}
                                         onClick={() => setShowSettings(true)}
-                                        className="p-3 rounded-xl bg-gray-700/50 hover:bg-gray-600 text-white border border-gray-600 transition-all"
-                                        title="Settings"
+                                        className="w-12 h-12 rounded-full flex items-center justify-center bg-gray-700/50 hover:bg-gray-600/50 text-white transition-all cursor-target z-100"
                                     >
-                                        <span className="text-xl">⚙️</span>
+                                        <Settings className="w-5 h-5" />
+                                    </motion.button>
+
+                                    {/* Participants */}
+                                    <motion.button
+                                        whileHover={{ scale: 1.05 }}
+                                        whileTap={{ scale: 0.95 }}
+                                        onClick={() => setShowParticipants(!showParticipants)}
+                                        className="w-12 h-12 rounded-full flex items-center justify-center bg-gray-700/50 hover:bg-gray-600/50 text-white transition-all cursor-target relative z-100"
+                                    >
+                                        <Users className="w-5 h-5" />
+                                        <Badge className="absolute -top-2 -right-2 bg-lime-500 text-white text-xs min-w-[20px] h-5">
+                                            {participants.length}
+                                        </Badge>
+                                    </motion.button>
+
+                                    {/* AI Translate Sidebar */}
+                                    <motion.button
+                                        whileHover={{ scale: 1.05 }}
+                                        whileTap={{ scale: 0.95 }}
+                                        onClick={() => setShowAITranslate(!showAITranslate)}
+                                        className={cn(
+                                            "w-12 h-12 rounded-full flex items-center justify-center transition-all cursor-target z-100 relative",
+                                            showAITranslate
+                                                ? "bg-purple-600/30 text-purple-300 border-2 border-purple-500/50"
+                                                : "bg-gray-700/50 hover:bg-gray-600/50 text-white"
+                                        )}
+                                    >
+                                        <Languages className="w-5 h-5" />
+                                        {speechLogs.length > 0 && (
+                                            <Badge className="absolute -top-2 -right-2 bg-purple-500 text-white text-xs min-w-[20px] h-5">
+                                                {speechLogs.length}
+                                            </Badge>
+                                        )}
                                     </motion.button>
 
                                     {/* Leave Room */}
@@ -1645,121 +2141,645 @@ const Room: React.FC = () => {
                                         whileHover={{ scale: 1.05 }}
                                         whileTap={{ scale: 0.95 }}
                                         onClick={handleLeaveRoom}
-                                        disabled={loading || roomLoading}
-                                        className="px-6 py-3 rounded-xl bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 disabled:opacity-50 text-white font-semibold transition-all border border-red-500"
-                                        title="Leave room"
+                                        className="w-12 h-12 rounded-full flex items-center justify-center bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-all cursor-target z-100"
                                     >
-                                        <span className="text-sm">
-                                            {loading ? 'Leaving...' : 'Leave'}
-                                        </span>
+                                        <PhoneOff className="w-5 h-5" />
                                     </motion.button>
                                 </div>
-                            </div>
-                        </motion.div>
 
-                        {/* Settings Modal */}
-                        {showSettings && (
-                            <motion.div
-                                initial={{ opacity: 0 }}
-                                animate={{ opacity: 1 }}
-                                exit={{ opacity: 0 }}
-                                className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 backdrop-blur-sm"
-                            >
+                                {/* Room Info */}
                                 <motion.div
-                                    initial={{ opacity: 0, scale: 0.9, y: 20 }}
-                                    animate={{ opacity: 1, scale: 1, y: 0 }}
-                                    exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                                    className="bg-gray-800/90 backdrop-blur-md rounded-2xl p-6 w-full max-w-md mx-4 border border-gray-700/50 shadow-2xl"
+                                    initial={{ opacity: 0 }}
+                                    animate={{ opacity: 1 }}
+                                    transition={{ delay: 0.6 }}
+                                    className="mt-4 text-center"
                                 >
-                                    <div className="flex justify-between items-center mb-6">
-                                        <h3 className="text-xl font-bold text-white">Settings</h3>
-                                        <motion.button
-                                            whileHover={{ scale: 1.1 }}
-                                            whileTap={{ scale: 0.9 }}
-                                            onClick={() => setShowSettings(false)}
-                                            className="text-gray-400 hover:text-white text-xl p-1 rounded-lg hover:bg-gray-700 transition-all"
-                                        >
-                                            ✕
-                                        </motion.button>
-                                    </div>
-
-                                    <div className="space-y-6">
-                                        {/* Camera Selection */}
-                                        <div>
-                                            <label className="block text-sm font-semibold text-gray-300 mb-3">
-                                                📹 Camera Device
-                                            </label>
-                                            <select
-                                                value={selectedCameraId}
-                                                onChange={(e) => handleCameraChange(e.target.value)}
-                                                disabled={isDevicesLoading}
-                                                className="w-full bg-gray-700/50 border border-gray-600 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-blue-500 disabled:opacity-50 transition-all backdrop-blur-sm"
-                                            >
-                                                <option value="">Select Camera...</option>
-                                                {availableDevices.cameras.map((camera) => (
-                                                    <option key={camera.deviceId} value={camera.deviceId}>
-                                                        {camera.label || `Camera ${camera.deviceId.substring(0, 8)}...`}
-                                                    </option>
-                                                ))}
-                                            </select>
+                                    <div className="flex items-center justify-center space-x-6 text-sm text-gray-400">
+                                        <div className="flex items-center space-x-2">
+                                            <Shield className="w-4 h-4" />
+                                            <span>End-to-End Encrypted</span>
                                         </div>
-
-                                        {/* Microphone Selection */}
-                                        <div>
-                                            <label className="block text-sm font-semibold text-gray-300 mb-3">
-                                                🎤 Microphone Device
-                                            </label>
-                                            <select
-                                                value={selectedMicrophoneId}
-                                                onChange={(e) => handleMicrophoneChange(e.target.value)}
-                                                disabled={isDevicesLoading}
-                                                className="w-full bg-gray-700/50 border border-gray-600 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-blue-500 disabled:opacity-50 transition-all backdrop-blur-sm"
-                                            >
-                                                <option value="">Select Microphone...</option>
-                                                {availableDevices.microphones.map((microphone) => (
-                                                    <option key={microphone.deviceId} value={microphone.deviceId}>
-                                                        {microphone.label || `Microphone ${microphone.deviceId.substring(0, 8)}...`}
-                                                    </option>
-                                                ))}
-                                            </select>
+                                        <div className="flex items-center space-x-2">
+                                            <Globe className="w-4 h-4" />
+                                            <span>P2P Network</span>
                                         </div>
-
-                                        {/* Refresh Devices */}
-                                        <motion.button
-                                            whileHover={{ scale: 1.02 }}
-                                            whileTap={{ scale: 0.98 }}
-                                            onClick={enumerateDevices}
-                                            disabled={isDevicesLoading}
-                                            className="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 disabled:opacity-50 text-white py-3 rounded-xl font-semibold transition-all"
-                                        >
-                                            {isDevicesLoading ? (
-                                                <div className="flex items-center justify-center space-x-2">
-                                                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
-                                                    <span>Loading...</span>
-                                                </div>
-                                            ) : '🔄 Refresh Devices'}
-                                        </motion.button>
-
-                                        {/* Device Status */}
-                                        <div className="pt-4 border-t border-gray-700/50">
-                                            <div className="text-sm text-gray-400 space-y-1">
-                                                <p>📹 Camera: {availableDevices.cameras.length} available</p>
-                                                <p>🎤 Microphone: {availableDevices.microphones.length} available</p>
-                                            </div>
+                                        <div className="flex items-center space-x-2">
+                                            <Activity className="w-4 h-4" />
+                                            <span>Real-time</span>
                                         </div>
                                     </div>
                                 </motion.div>
-                            </motion.div>
-                        )}
+                            </div>
+                        </motion.div>
                     </motion.div>
                 )}
-            </div>
+            </main>
+
+            {/* Participants Sidebar */}
+            <AnimatePresence>
+                {showParticipants && (
+                    <motion.div
+                        initial={{ opacity: 0, x: 300 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: 300 }}
+                        className="fixed top-16 right-0 bottom-0 w-80 bg-gray-900/90 backdrop-blur-md border-l border-gray-700/50 z-50"
+                    >
+                        <div className="p-6 h-full flex flex-col">
+                            <div className="flex items-center justify-between mb-6">
+                                <h3 className="text-lg font-semibold text-white">Participants</h3>
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => setShowParticipants(false)}
+                                    className="text-gray-400 hover:text-white cursor-target"
+                                >
+                                    <EyeOff className="w-4 h-4" />
+                                </Button>
+                            </div>
+
+                            <div className="space-y-3 flex-1 overflow-y-auto">
+                                {/* Current User */}
+                                <div className="flex items-center space-x-3 p-3 bg-green-500/10 rounded-lg border border-green-500/20 cursor-target">
+                                    <div className="w-10 h-10 bg-green-400/20 rounded-full flex items-center justify-center">
+                                        <User className="w-5 h-5 text-green-400" />
+                                    </div>
+                                    <div className="flex-1">
+                                        <p className="text-sm font-medium text-white">
+                                            {String(user?.name || '').trim() || String(user?.username || '').trim()} (You)
+                                        </p>
+                                        <p className="text-xs text-green-300">{isHost ? 'Host' : 'Participant'}</p>
+                                    </div>
+                                    <Badge className="bg-green-500/20 text-green-300 border-green-500/30">
+                                        Online
+                                    </Badge>
+                                </div>
+
+                                {/* Other Participants */}
+                                {participants
+                                    .filter(participant => participant !== principalId)
+                                    .map((participant, index) => (
+                                        <motion.div
+                                            key={participant}
+                                            initial={{ opacity: 0, y: 20 }}
+                                            animate={{ opacity: 1, y: 0 }}
+                                            transition={{ delay: index * 0.1 }}
+                                            className="flex items-center space-x-3 p-3 bg-gray-800/50 rounded-lg border border-gray-600/50 cursor-target"
+                                        >
+                                            <div className="w-10 h-10 bg-blue-400/20 rounded-full flex items-center justify-center">
+                                                <User className="w-5 h-5 text-blue-400" />
+                                            </div>
+                                            <div className="flex-1">
+                                                <p className="text-sm font-medium text-white">
+                                                    {`User #${index + 1}`}
+                                                </p>
+                                                <p className="text-xs text-gray-400">
+                                                    {participant.length > 20
+                                                        ? `${participant.substring(0, 20)}...`
+                                                        : participant
+                                                    }
+                                                </p>
+                                            </div>
+                                            <Badge className="bg-blue-500/20 text-blue-300 border-blue-500/30">
+                                                Connected
+                                            </Badge>
+                                        </motion.div>
+                                    ))
+                                }
+
+                                {/* Empty State when no other participants */}
+                                {participants.filter(participant => participant !== principalId).length === 0 && (
+                                    <motion.div
+                                        initial={{ opacity: 0 }}
+                                        animate={{ opacity: 1 }}
+                                        className="text-center py-8"
+                                    >
+                                        <div className="w-16 h-16 bg-gray-600/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                                            <Users className="w-8 h-8 text-gray-500" />
+                                        </div>
+                                        <p className="text-gray-400 text-sm mb-2">No other participants yet</p>
+                                        <p className="text-gray-500 text-xs">Share the room id to invite others</p>
+                                    </motion.div>
+                                )}
+                            </div>
+
+                            <div className="pt-4 border-t border-gray-700/50">
+                                <div className="space-y-3">
+                                    {/* Room Info */}
+                                    <div className="bg-gray-800/30 rounded-lg p-3">
+                                        <div className="flex items-center justify-between text-xs text-gray-400 mb-2">
+                                            <span>Room ID</span>
+                                            <span className="font-mono">{roomId}</span>
+                                        </div>
+                                        <div className="flex items-center justify-between text-xs text-gray-400">
+                                            <span>Total Participants</span>
+                                            <span>{participants.length}</span>
+                                        </div>
+                                    </div>
+
+                                    {/* Invite Button */}
+                                    <Button
+                                        onClick={copyRoomLink}
+                                        className="w-full bg-lime-600 hover:bg-lime-700 cursor-target"
+                                    >
+                                        <Copy className="w-4 h-4 mr-2" />
+                                        Invite Others
+                                    </Button>
+                                </div>
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            {/* AI Translation Sidebar */}
+            <AnimatePresence>
+                {showAITranslate && (
+                    <motion.div
+                        initial={{ opacity: 0, x: -300 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: -300 }}
+                        className="fixed top-16 left-0 bottom-0 w-96 bg-gray-900/90 backdrop-blur-md border-r border-gray-700/50 z-50"
+                    >
+                        <div className="p-6 h-full flex flex-col">
+                            {/* Header */}
+                            <div className="flex items-center justify-between mb-6">
+                                <div className="flex items-center space-x-3">
+                                    <Languages className="w-5 h-5 text-purple-400" />
+                                    <h3 className="text-lg font-semibold text-white">AI Translation</h3>
+                                </div>
+                                <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => setShowAITranslate(false)}
+                                    className="text-gray-400 hover:text-white cursor-target"
+                                >
+                                    ✕
+                                </Button>
+                            </div>
+
+                            {/* Controls */}
+                            <div className="space-y-4 mb-6">
+                                {/* Source Language Selection */}
+                                <div>
+                                    <label className="block text-sm font-medium mb-2 text-white">
+                                        From (Source Language)
+                                    </label>
+                                    <select
+                                        value={sourceLanguage}
+                                        onChange={(e) => {
+                                            setSourceLanguage(e.target.value);
+                                            // Restart speech recognition with new language if active
+                                            if (recognitionActive) {
+                                                stopAITranscription();
+                                                setTimeout(() => {
+                                                    startAITranscription();
+                                                }, 500);
+                                            }
+                                        }}
+                                        className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-3 py-2 text-white cursor-target scrollbar-hidden"
+                                    >
+                                        {supportedLanguages.map(lang => (
+                                            <option key={lang} value={lang}>
+                                                {getLanguageName(lang)}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Target Language Selection */}
+                                <div>
+                                    <label className="block text-sm font-medium mb-2 text-white">
+                                        To (Target Language)
+                                    </label>
+                                    <select
+                                        value={targetLanguage}
+                                        onChange={(e) => setTargetLanguage(e.target.value)}
+                                        className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-3 py-2 text-white cursor-target scrollbar-hidden"
+                                    >
+                                        {supportedLanguages.map(lang => (
+                                            <option key={lang} value={lang}>
+                                                {getLanguageName(lang)}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Transcription Controls */}
+                                <div className="flex items-center space-x-3">
+                                    <Button
+                                        onClick={startAITranscription}
+                                        disabled={isTranscribing}
+                                        size="sm"
+                                        className={cn(
+                                            "flex-1",
+                                            isTranscribing
+                                                ? "bg-green-600/50 cursor-not-allowed"
+                                                : "bg-green-600 hover:bg-green-700"
+                                        )}
+                                    >
+                                        <Play className="w-4 h-4 mr-2" />
+                                        {isTranscribing ? 'Listening...' : 'Start Listening'}
+                                    </Button>
+
+                                    <Button
+                                        onClick={stopAITranscription}
+                                        disabled={!isTranscribing}
+                                        size="sm"
+                                        variant="destructive"
+                                        className="disabled:opacity-50"
+                                    >
+                                        <Pause className="w-4 h-4" />
+                                    </Button>
+
+                                    <Button
+                                        onClick={clearSpeechLogs}
+                                        size="sm"
+                                        variant="outline"
+                                        className="border-gray-600 hover:bg-gray-700"
+                                    >
+                                        <Trash className='w-4 h-4' />
+                                    </Button>
+                                </div>
+                            </div>
+
+                            {/* Translate Logs */}
+                            <div className="flex-1 overflow-hidden">
+                                <div className="flex items-center justify-between mb-3">
+                                    <h4 className="text-sm font-medium text-white">Translate Logs</h4>
+                                    {translationLoading && (
+                                        <div className="flex items-center space-x-2 text-purple-400">
+                                            <div className="w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                                            <span className="text-xs">Translating...</span>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="space-y-3 overflow-y-auto h-full scrollbar-hidden">
+                                    {speechLogs.length === 0 ? (
+                                        <div className="text-center py-8">
+                                            <MessageSquare className="w-12 h-12 text-gray-500 mx-auto mb-3" />
+                                            <p className="text-gray-400 text-sm">No speech detected yet</p>
+                                            <p className="text-gray-500 text-xs mt-1">Start listening to see translations</p>
+                                        </div>
+                                    ) : (
+                                        speechLogs.map((log) => (
+                                            <motion.div
+                                                key={log.id}
+                                                initial={{ opacity: 0, y: 20 }}
+                                                animate={{ opacity: 1, y: 0 }}
+                                                className={cn(
+                                                    "p-3 rounded-lg border-l-4",
+                                                    log.isLocal
+                                                        ? "bg-green-500/10 border-green-400"
+                                                        : "bg-blue-500/10 border-blue-400"
+                                                )}
+                                            >
+                                                {/* Header */}
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <div className="flex items-center space-x-2">
+                                                        <div className={`w-6 h-6 rounded-full flex items-center justify-center ${log.isLocal ? 'bg-green-400/20' : 'bg-blue-400/20'
+                                                            }`}>
+                                                            {log.isLocal ? (
+                                                                <Mic2 className={`w-3 h-3 ${log.isLocal ? 'text-green-400' : 'text-blue-400'}`} />
+                                                            ) : (
+                                                                <Volume2 className={`w-3 h-3 ${log.isLocal ? 'text-green-400' : 'text-blue-400'}`} />
+                                                            )}
+                                                        </div>
+                                                        <span className="text-xs font-medium text-white">
+                                                            {log.participantName}
+                                                        </span>
+                                                    </div>
+                                                    <span className="text-xs text-gray-400">
+                                                        {log.timestamp.toLocaleTimeString()}
+                                                    </span>
+                                                </div>
+
+                                                {/* Original Text */}
+                                                <div className="mb-2">
+                                                    <div className="flex items-center space-x-2 mb-1">
+                                                        <span className="text-xs text-gray-400">From:</span>
+                                                        <Badge variant="outline" className="text-xs font-mono">
+                                                            {log.participantId.length > 12
+                                                                ? `${log.participantId.substring(0, 12)}...`
+                                                                : log.participantId
+                                                            }
+                                                        </Badge>
+                                                    </div>
+                                                    <p className="text-sm text-white">{log.originalText}</p>
+                                                </div>
+
+                                                {/* Translation */}
+                                                <div>
+                                                    <div className="flex items-center space-x-2 mb-1">
+                                                        <span className="text-xs text-gray-400">Translation:</span>
+                                                        <Badge variant="outline" className="text-xs text-purple-400">
+                                                            {getLanguageName(targetLanguage)}
+                                                        </Badge>
+                                                    </div>
+
+                                                    {log.isTranslating ? (
+                                                        <div className="flex items-center space-x-2 text-purple-400">
+                                                            <div className="w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                                                            <span className="text-sm">Translating...</span>
+                                                        </div>
+                                                    ) : (
+                                                        <p className="text-sm text-purple-300 bg-purple-500/10 rounded p-2">
+                                                            {log.translatedText}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            </motion.div>
+                                        ))
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Footer Info */}
+                            <div className="pt-4 border-t border-gray-700/50">
+                                <div className="text-xs text-gray-400 space-y-1">
+                                    <div className="flex items-center justify-between">
+                                        <span>AI Translation</span>
+                                        <span className="text-purple-400">LLaMA 3.1</span>
+                                    </div>
+                                    <div className="flex items-center justify-between">
+                                        <span>Total Logs</span>
+                                        <span>{speechLogs.length}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            {/* Settings Modal */}
+            <AnimatePresence>
+                {showSettings && (
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 backdrop-blur-md"
+                        onClick={() => setShowSettings(false)}
+                    >
+                        <motion.div
+                            initial={{ opacity: 0, scale: 0.8, y: 50 }}
+                            animate={{ opacity: 1, scale: 1, y: 0 }}
+                            exit={{ opacity: 0, scale: 0.8, y: 50 }}
+                            onClick={(e) => e.stopPropagation()}
+                            className="bg-gradient-to-br from-gray-900/95 to-gray-800/95 backdrop-blur-xl rounded-3xl w-full max-w-lg mx-4 border border-gray-600/30 shadow-2xl overflow-hidden"
+                        >
+                            {/* Header with Gradient */}
+                            <div className="relative bg-gradient-to-r from-lime-500/10 to-purple-500/10 p-6 border-b border-gray-700/50">
+                                <div className="absolute inset-0 bg-gradient-to-r from-lime-400/5 to-purple-400/5" />
+                                <div className="relative flex items-center justify-between">
+                                    <div className="flex items-center space-x-3">
+                                        <div className="w-10 h-10 bg-gradient-to-br from-lime-400/20 to-purple-400/20 rounded-xl flex items-center justify-center border border-lime-400/20">
+                                            <Settings className="w-5 h-5 text-lime-400" />
+                                        </div>
+                                        <div>
+                                            <h3 className="text-xl font-bold text-white">Settings</h3>
+                                            <p className="text-sm text-gray-400">Configure your media devices</p>
+                                        </div>
+                                    </div>
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        onClick={() => setShowSettings(false)}
+                                        className="text-gray-400 hover:text-white hover:bg-gray-700/50 rounded-xl cursor-target transition-all"
+                                    >
+                                        ✕
+                                    </Button>
+                                </div>
+                            </div>
+
+                            {/* Content */}
+                            <div className="p-6 space-y-6">
+                                {/* Camera Section */}
+                                <motion.div
+                                    initial={{ opacity: 0, y: 20 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    transition={{ delay: 0.1 }}
+                                    className="space-y-3"
+                                >
+                                    <div className="flex items-center space-x-3 mb-3">
+                                        <div className="w-8 h-8 bg-blue-500/20 rounded-lg flex items-center justify-center">
+                                            <Video className="w-4 h-4 text-blue-400" />
+                                        </div>
+                                        <div>
+                                            <label className="text-sm font-semibold text-white">Camera Device</label>
+                                            <p className="text-xs text-gray-400">Select your preferred camera</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="relative">
+                                        <select
+                                            value={selectedCameraId}
+                                            onChange={(e) => handleCameraChange(e.target.value)}
+                                            className="w-full bg-gray-800/50 border border-gray-600/50 rounded-xl px-4 py-3 text-white cursor-target focus:outline-none focus:ring-2 focus:ring-lime-400/50 focus:border-lime-400/50 transition-all appearance-none pr-10"
+                                        >
+                                            <option value="">Default Camera</option>
+                                            {availableDevices.cameras.map((device, index) => (
+                                                <option key={device.deviceId} value={device.deviceId}>
+                                                    {device.label || `Camera ${index + 1}`}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <ChevronDown className="absolute right-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+                                    </div>
+
+                                    {/* Camera Status */}
+                                    <div className="flex items-center justify-between p-3 bg-gray-800/30 rounded-lg border border-gray-700/30">
+                                        <div className="flex items-center space-x-2">
+                                            <div className={`w-2 h-2 rounded-full ${isCameraEnabled ? 'bg-green-400 animate-pulse' : 'bg-gray-500'}`} />
+                                            <span className="text-sm text-gray-300">
+                                                Camera: {isCameraEnabled ? 'Enabled' : 'Disabled'}
+                                            </span>
+                                        </div>
+                                        <Badge variant="outline" className="text-xs text-blue-400 border-blue-500/30">
+                                            {availableDevices.cameras.length} available
+                                        </Badge>
+                                    </div>
+                                </motion.div>
+
+                                {/* Microphone Section */}
+                                <motion.div
+                                    initial={{ opacity: 0, y: 20 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    transition={{ delay: 0.2 }}
+                                    className="space-y-3"
+                                >
+                                    <div className="flex items-center space-x-3 mb-3">
+                                        <div className="w-8 h-8 bg-green-500/20 rounded-lg flex items-center justify-center">
+                                            <Mic className="w-4 h-4 text-green-400" />
+                                        </div>
+                                        <div>
+                                            <label className="text-sm font-semibold text-white">Microphone Device</label>
+                                            <p className="text-xs text-gray-400">Select your preferred microphone</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="relative">
+                                        <select
+                                            value={selectedMicrophoneId}
+                                            onChange={(e) => handleMicrophoneChange(e.target.value)}
+                                            className="w-full bg-gray-800/50 border border-gray-600/50 rounded-xl px-4 py-3 text-white cursor-target focus:outline-none focus:ring-2 focus:ring-lime-400/50 focus:border-lime-400/50 transition-all appearance-none pr-10"
+                                        >
+                                            <option value="">Default Microphone</option>
+                                            {availableDevices.microphones.map((device, index) => (
+                                                <option key={device.deviceId} value={device.deviceId}>
+                                                    {device.label || `Microphone ${index + 1}`}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <ChevronDown className="absolute right-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+                                    </div>
+
+                                    {/* Microphone Status */}
+                                    <div className="flex items-center justify-between p-3 bg-gray-800/30 rounded-lg border border-gray-700/30">
+                                        <div className="flex items-center space-x-2">
+                                            <div className={`w-2 h-2 rounded-full ${isMicrophoneEnabled ? 'bg-green-400 animate-pulse' : 'bg-gray-500'}`} />
+                                            <span className="text-sm text-gray-300">
+                                                Microphone: {isMicrophoneEnabled ? 'Enabled' : 'Disabled'}
+                                            </span>
+                                        </div>
+                                        <Badge variant="outline" className="text-xs text-green-400 border-green-500/30">
+                                            {availableDevices.microphones.length} available
+                                        </Badge>
+                                    </div>
+                                </motion.div>
+                            </div>
+
+                            {/* Footer Actions */}
+                            <div className="p-6 bg-gray-800/30 border-t border-gray-700/50">
+                                <div className="space-y-4">
+                                    {/* Refresh Devices Button */}
+                                    <motion.button
+                                        whileHover={{ scale: 1.02 }}
+                                        whileTap={{ scale: 0.98 }}
+                                        onClick={enumerateDevices}
+                                        disabled={isDevicesLoading}
+                                        className="w-full bg-gradient-to-r from-lime-500/90 to-green-500/90 hover:from-lime-600 hover:to-green-600 disabled:opacity-50 disabled:cursor-not-allowed text-white py-3 px-4 rounded-xl font-semibold transition-all cursor-target flex items-center justify-center space-x-2 shadow-lg"
+                                    >
+                                        {isDevicesLoading ? (
+                                            <>
+                                                <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent" />
+                                                <span>Refreshing Devices...</span>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <Camera className="w-4 h-4" />
+                                                <span>Refresh All Devices</span>
+                                            </>
+                                        )}
+                                    </motion.button>
+
+                                    {/* Quick Actions */}
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <Button
+                                            onClick={() => {
+                                                toggleCamera();
+                                                setShowSettings(false);
+                                            }}
+                                            variant="outline"
+                                            className="border-gray-600 hover:bg-gray-700/50 text-white cursor-target"
+                                        >
+                                            <Video className="w-4 h-4 mr-2" />
+                                            {isCameraEnabled ? 'Turn Off Camera' : 'Turn On Camera'}
+                                        </Button>
+                                        <Button
+                                            onClick={() => {
+                                                toggleMicrophone();
+                                                setShowSettings(false);
+                                            }}
+                                            variant="outline"
+                                            className="border-gray-600 hover:bg-gray-700/50 text-white cursor-target"
+                                        >
+                                            <Mic className="w-4 h-4 mr-2" />
+                                            {isMicrophoneEnabled ? 'Mute Mic' : 'Unmute Mic'}
+                                        </Button>
+                                    </div>
+
+                                    {/* Device Statistics */}
+                                    <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700/30">
+                                        <h4 className="text-sm font-medium text-white mb-3 flex items-center">
+                                            <Activity className="w-4 h-4 mr-2 text-lime-400" />
+                                            Device Status
+                                        </h4>
+                                        <div className="grid grid-cols-2 gap-4 text-xs">
+                                            <div>
+                                                <div className="flex items-center justify-between mb-1">
+                                                    <span className="text-gray-400">Cameras Found</span>
+                                                    <span className="text-blue-400 font-medium">{availableDevices.cameras.length}</span>
+                                                </div>
+                                                <div className="w-full bg-gray-700 rounded-full h-1.5">
+                                                    <div
+                                                        className="bg-blue-400 h-1.5 rounded-full transition-all"
+                                                        style={{ width: `${Math.min(availableDevices.cameras.length * 25, 100)}%` }}
+                                                    />
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="flex items-center justify-between mb-1">
+                                                    <span className="text-gray-400">Microphones Found</span>
+                                                    <span className="text-green-400 font-medium">{availableDevices.microphones.length}</span>
+                                                </div>
+                                                <div className="w-full bg-gray-700 rounded-full h-1.5">
+                                                    <div
+                                                        className="bg-green-400 h-1.5 rounded-full transition-all"
+                                                        style={{ width: `${Math.min(availableDevices.microphones.length * 25, 100)}%` }}
+                                                    />
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </motion.div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             {/* Background Effects */}
-            <div className="fixed inset-0 pointer-events-none">
-                <div className="absolute top-1/4 left-1/4 w-72 h-72 bg-blue-600/10 rounded-full blur-3xl"></div>
-                <div className="absolute bottom-1/4 right-1/4 w-72 h-72 bg-purple-600/10 rounded-full blur-3xl"></div>
-                <div className="absolute top-3/4 left-1/2 w-72 h-72 bg-green-600/10 rounded-full blur-3xl"></div>
+            <div className="fixed inset-0 pointer-events-none z-0">
+                <motion.div
+                    className="absolute top-1/4 left-1/4 w-72 h-72 bg-lime-600/10 rounded-full blur-3xl"
+                    animate={{
+                        scale: [1, 1.2, 1],
+                        opacity: [0.3, 0.5, 0.3],
+                    }}
+                    transition={{
+                        duration: 8,
+                        repeat: Infinity,
+                        ease: "easeInOut"
+                    }}
+                />
+                <motion.div
+                    className="absolute bottom-1/4 right-1/4 w-72 h-72 bg-purple-600/10 rounded-full blur-3xl"
+                    animate={{
+                        scale: [1.2, 1, 1.2],
+                        opacity: [0.5, 0.3, 0.5],
+                    }}
+                    transition={{
+                        duration: 6,
+                        repeat: Infinity,
+                        ease: "easeInOut",
+                        delay: 2
+                    }}
+                />
+                <motion.div
+                    className="absolute top-3/4 left-1/2 w-72 h-72 bg-green-600/10 rounded-full blur-3xl"
+                    animate={{
+                        scale: [1, 1.3, 1],
+                        opacity: [0.4, 0.6, 0.4],
+                    }}
+                    transition={{
+                        duration: 10,
+                        repeat: Infinity,
+                        ease: "easeInOut",
+                        delay: 4
+                    }}
+                />
             </div>
         </div>
     );

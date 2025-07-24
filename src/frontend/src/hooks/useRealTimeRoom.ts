@@ -48,18 +48,18 @@ export const useRealTimeRoom = (
         
         setIsHost(hostText === principalId);
         
-        // Convert participants to readable format
-        const participantIds = room.participants.map(p => {
-            if (p && typeof p.toText === 'function') {
-                const text = p.toText();
-                return text.substring(0, 8) + '...' + text.substring(text.length - 8);
-            } else if (p && p.toString) {
-                const text = p.toString();
-                return text.substring(0, 8) + '...' + text.substring(text.length - 8);
-            } else {
-                return 'Invalid Principal';
-            }
-        }).filter(id => id !== 'Invalid Principal');
+        // Convert participants to full text format
+        const participantIds = room.participants
+            .map(p => {
+                if (p && typeof p.toText === 'function') {
+                    return p.toText();
+                } else if (p && p.toString) {
+                    return p.toString();
+                } else {
+                    return null;
+                }
+            })
+            .filter((id): id is string => !!id);
         
         // Check if participants actually changed
         const newParticipantHash = participantIds.sort().join(',');
