@@ -115,5 +115,7 @@ Make sure you have the following installed:
    dfx start --clean
    ```
 
+---
+
 ### License
 This project is licensed under the MIT License - see the LICENSE file for details.
