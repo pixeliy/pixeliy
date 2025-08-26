@@ -66,7 +66,7 @@ export const LoginRequired: React.FC<LoginRequiredProps> = ({
     ];
 
     return (
-        <div className="min-h-screen bg-black text-white overflow-hidden relative">
+        <div className="min-h-screen bg-black text-white overflow-hidden relative z-[1000]">
             {/* Target Cursor */}
             <TargetCursor targetSelector=".cursor-target" spinDuration={2} hideDefaultCursor={true} />
 
@@ -83,7 +83,7 @@ export const LoginRequired: React.FC<LoginRequiredProps> = ({
                 squaresClassName="hover:fill-lime-500 transition-all duration-300"
             />
 
-            {/* Overlay - DI BAWAH grid */}
+            {/* Overlay */}
             <div className="absolute inset-0 z-[1] pointer-events-none">
                 <div className="absolute inset-0 bg-gradient-to-b from-black/50 via-transparent to-black/50" />
                 <div className="absolute inset-0 bg-gradient-to-r from-lime-500/3 via-transparent to-green-500/3" />

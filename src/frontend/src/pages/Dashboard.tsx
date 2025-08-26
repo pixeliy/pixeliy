@@ -88,58 +88,58 @@ const Dashboard: React.FC = () => {
     // Dummy data for featured hubs
     const featuredHubs = [
         {
-            id: 'HUB-001',
-            name: 'Digital Workspace',
-            participants: 15,
+            id: 'PIXELIY',
+            name: 'Pixeliy HQ',
+            participants: 0,
             type: 'Collaboration',
             status: 'active',
             description: 'Team collaboration and project management',
             tags: ['Work', 'Team', 'Productivity']
         },
         {
-            id: 'MEET-042',
-            name: 'Weekly Standup',
-            participants: 8,
+            id: 'WCHL',
+            name: 'World Computer Hacker League',
+            participants: 0,
             type: 'Meeting',
             status: 'active',
-            description: 'Regular team synchronization meeting',
-            tags: ['Meeting', 'Sync', 'Team']
+            description: 'Weekly sync for global hackers',
+            tags: ['Hackathon', 'Hackers', 'Team',]
         },
         {
-            id: 'LEARN-007',
-            name: 'Blockchain Study',
-            participants: 23,
+            id: 'CAFFEINE',
+            name: 'Caffeine AI',
+            participants: 0,
+            type: 'Development',
+            status: 'active',
+            description: 'AI development and brainstorming',
+            tags: ['Code', 'Review', 'Dev']
+        },
+        {
+            id: 'COMMIT',
+            name: 'Commit Community',
+            participants: 0,
             type: 'Education',
             status: 'active',
             description: 'Learn about blockchain technology together',
             tags: ['Learning', 'Blockchain', 'Tech']
         },
         {
-            id: 'SOCIAL-15',
-            name: 'Coffee Chat',
-            participants: 12,
+            id: 'MUSIC',
+            name: 'Music Lounge',
+            participants: 0,
             type: 'Social',
             status: 'active',
-            description: 'Casual conversation and networking',
+            description: 'Chill and chat about music',
             tags: ['Social', 'Chat', 'Networking']
         },
         {
-            id: 'DEV-099',
-            name: 'Code Review',
-            participants: 6,
-            type: 'Development',
+            id: 'WORLD',
+            name: 'Global P2P',
+            participants: 0,
+            type: 'Networking',
             status: 'active',
-            description: 'Review and discuss code together',
-            tags: ['Code', 'Review', 'Dev']
-        },
-        {
-            id: 'ART-003',
-            name: 'Creative Studio',
-            participants: 18,
-            type: 'Creative',
-            status: 'active',
-            description: 'Share and create art together',
-            tags: ['Art', 'Creative', 'Design']
+            description: 'Connect with peers worldwide',
+            tags: ['Networking', 'Global', 'Peers']
         }
     ];
 
@@ -761,7 +761,7 @@ const Dashboard: React.FC = () => {
                                                 </div>
                                                 <div>
                                                     <CardTitle className="text-2xl text-transparent bg-gradient-to-r from-orange-400 via-yellow-400 to-amber-400 bg-clip-text">
-                                                        Pixeliy Shop
+                                                        Marketplace
                                                     </CardTitle>
                                                     <p className="text-orange-300/80 text-sm">Digital assets & premium features</p>
                                                 </div>

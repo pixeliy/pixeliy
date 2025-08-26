@@ -1,41 +1,63 @@
 # Pixeliy - Decentralized Real-Time Communication Platform
 
+**Website:** [https://pixeliy.com](https://pixeliy.com)
+
 Pixeliy is a decentralized real-time communication (dRTC) platform built on the Internet Computer Protocol (ICP). Pixeliy allows users to create and join peer-to-peer video meeting rooms without a central server, with a fully decentralized signaling, identity, and communication system.
 
-## Features
+---
 
-- **Decentralized Architecture**: Built on Internet Computer Protocol (ICP) for true decentralization
-- **Internet Identity Authentication**: Secure, privacy-preserving authentication using Internet Identity
-- **Peer-to-Peer Video Calls**: Direct WebRTC connections between participants
-- **Real-Time Room Management**: Dynamic participant tracking and room state synchronization
-- **Device Control**: Camera and microphone management with device selection
-- **Responsive Design**: Modern UI with Tailwind CSS and Framer Motion animations
-- **TypeScript Support**: Full type safety across frontend and backend
+## 🚀 Key Features
 
-## Architecture
+-  **Decentralized Identity** with Internet Identity (II)
+-  **Peer-to-Peer Video Calls** via WebRTC with on-chain signaling
+-  **AI Translator (Beta)** for real-time multilingual meetings
+-  **Modular Architecture** with Motoko + React/TypeScript
+-  **Modern UI** with TailwindCSS and Framer Motion
+-  **Smart Room Management** and state synchronization
+
+---
+
+## 🛠 Architecture Overview
 
 ### Backend (Motoko)
-- **User Service**: Handle user authentication and profile management
-- **Room Service**: Manage room creation, joining, and participant tracking
-- **Signal Service**: WebRTC signaling coordination for peer connections
-- **Internet Identity Integration**: Decentralized authentication
+- **UserService**: Auth & user profile on-chain
+- **RoomService**: Create, join, and manage video rooms
+- **SignalService**: WebRTC signaling (offers/answers/ICE) via canister
+- **ICP Authentication**: Seamless auth with Internet Identity
+- **MOPS Package Manager**: Dependency & module management
 
 ### Frontend (React + TypeScript)
-- **React Router**: Navigation between Home, Profile, Dashboard, and Room pages
-- **WebRTC Integration**: Peer-to-peer video communication
-- **Real-time Hooks**: Custom hooks for room state and authentication
-- **Device Management**: Camera/microphone selection and control
+- **Internet Identity login**
+- **Custom Hooks**: `useAuth`, `useRoom`, `useSignal`
+- **WebRTC integration** with real-time peer connection logic
+- **Tailwind CSS** UI, framer motion transitions
+- **Dynamic routing** via React Router
 
-## Tech Stack
+---
 
-- **Backend**: Motoko (Internet Computer)
-- **Frontend**: React, TypeScript, Vite
-- **Styling**: Tailwind CSS
-- **Animation**: Framer Motion
-- **Authentication**: Internet Identity
-- **Communication**: WebRTC for peer-to-peer connections
+## 📈 Roadmap
 
-## Getting Started
+### Q3 2025 (Completed)
+- Core P2P Communication  
+- End-to-End Encryption  
+- Smart Room Creation  
+- Cross-Platform Support  
+
+### Q3 2025 (In Progress)
+- Real-Time AI Translation (100+ languages)  
+- AI Agent Assistant  
+- Smart Meeting Summaries  
+- Intelligent Scheduling  
+
+### Q4 2025+
+- Tokenization (PIXL token, rewards)  
+- Immersive AI Avatars  
+- Custom Agent Personalization  
+- NFT Marketplace for Digital Assets  
+
+---
+
+## 💻 Local Development
 
 ### Prerequisites
 
@@ -92,6 +114,8 @@ Make sure you have the following installed:
    # Reset local state (use with caution)
    dfx start --clean
    ```
+
+---
 
 ### License
 This project is licensed under the MIT License - see the LICENSE file for details.

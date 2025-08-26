@@ -1,2786 +1,3576 @@
-"use client"
+"use client";
 
-import React, { useState, useRef, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { motion, AnimatePresence } from 'framer-motion';
-import { Principal } from '@dfinity/principal';
-import { InteractiveGridPattern } from '@/components/ui/interactive-grid';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { cn } from '@/lib/utils';
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import Peer, { DataConnection, MediaConnection } from "peerjs";
+import { useParams, useNavigate } from "react-router-dom";
+import { motion, AnimatePresence } from "framer-motion";
+import { Principal } from "@dfinity/principal";
+import { canisterService } from "../services/canisterService";
+import { useAuth } from "../contexts/AuthContext";
+import { useRoom } from "../hooks/useRoom";
 import {
-    Video, VideoOff, Mic, MicOff, Settings,
-    PhoneOff, Copy, Users, User, Globe, Shield,
-    Activity, Camera, AlertTriangle, EyeOff,
-    Languages, MessageSquare, Mic2, Volume2,
-    ChevronDown, Pause, Play,
-    Trash
-} from 'lucide-react';
-import TargetCursor from '../components/target-cursor';
-import { useAuth } from '../contexts/AuthContext';
-import { useRoom } from '../hooks/useRoom';
-import { useRealTimeRoom } from '../hooks/useRealTimeRoom';
-import { useTranslation } from '../hooks/useTranslation';
-import LoginRequired from '../components/auth/LoginRequired';
-import ProfileSetupRequired from '../components/auth/ProfileSetupRequired';
-import { Signal } from '../types/backend';
+    MessageSquare as IconChat,
+    Users as IconUsers,
+    Mic as IconMicOn,
+    MicOff as IconMicOff,
+    ChevronDown as IconChevronDown,
+    ChevronUp as IconChevronUp,
+    Plus as IconZoomIn,
+    Minus as IconZoomOut,
+    UserPen as IconOutfit,
+    LogOut as IconLeave,
+    Settings as IconSettings,
+    Copy as IconCopy,
+} from "lucide-react";
+import {
+    loadSpriteParts,
+    loadOutfitParts,
+    drawPlayerSprite,
+    drawPlayerShadow,
+    type SpriteParts,
+    type OutfitParts,
+    type AnimSample,
+    type FaceState,
+    type OutfitLibrary,
+} from "../components/player/sprite";
+import {
+    DEFAULT_OUTFIT,
+    normalizeSlots,
+    OUTFIT_OPTIONS,
+    OUTFIT_SLOT_ORDER,
+    type OutfitSlotsArray,
+} from "../constants/outfit";
+import { buildActiveOutfit } from "../lib/resolveOutfit";
+import {
+    TILE,
+    MAP_COLS,
+    MAP_ROWS,
+    loadWorldMap,
+    type WorldMap,
+    resolveMove,
+    isSolidTile,
+    audioRuleAt,
+    wallLayout,
+    topLayout,
+    DOOR_OPEN_ID,
+    DOOR_CLOSED_ID,
+    TOP_DOOR_OPEN_ID,
+    TOP_DOOR_CLOSED_ID,
+} from "../components/world/map";
+import PixelReveal from "@/components/pixel-reveal";
 
-// Animation variants 
-const smoothTransition = {
-    duration: 0.8,
-    ease: "easeOut" as const,
+/** ===== TURN  ===== */
+const TURN_HOST = import.meta.env.VITE_TURN_HOST as string | undefined;
+const TURN_PORT = import.meta.env.VITE_TURN_PORT as string | undefined;
+const TURNS_PORT = import.meta.env.VITE_TURNS_PORT as string | undefined;
+const TURN_USER = import.meta.env.VITE_TURN_USERNAME as string | undefined;
+const TURN_CRED = import.meta.env.VITE_TURN_CREDENTIAL as string | undefined;
+
+const rtcConfig: RTCConfiguration = {
+    iceServers: [
+        { urls: [`turn:${TURN_HOST}:${TURN_PORT}?transport=udp`], username: TURN_USER!, credential: TURN_CRED },
+        { urls: [`turn:${TURN_HOST}:${TURN_PORT}?transport=tcp`], username: TURN_USER!, credential: TURN_CRED },
+        { urls: [`turns:${TURN_HOST}:${TURNS_PORT}?transport=tcp`], username: TURN_USER!, credential: TURN_CRED },
+
+    ],
+    iceTransportPolicy: "relay",
+    bundlePolicy: "balanced",
 };
 
-interface PeerConnectionData {
-    pc: RTCPeerConnection;
-    remoteStream: MediaStream | null;
-    videoElement: HTMLVideoElement | null;
-    connectionState: RTCPeerConnectionState;
-    hasRemoteDescription: boolean;
-    hasLocalDescription: boolean;
-    isOfferer: boolean;
-    isAnswerer: boolean;
-}
+/** utils */
+const pretty = (id: string) => (id.length > 14 ? id.slice(0, 6) + "..." + id.slice(-6) : id);
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+const principalToText = (p: any) => {
+    try { if (p && typeof p.toText === "function") return p.toText(); if (typeof p === "string") return p; } catch { }
+    return String(p);
+};
 
-interface SpeechLog {
-    id: string;
-    participantId: string;
-    participantName: string;
-    originalText: string;
-    translatedText?: string;
-    detectedLanguage?: string;
-    timestamp: Date;
-    isTranslating: boolean;
-    isLocal: boolean;
-    confidence?: number;
-}
+const formatBadge = (n: number) => (n > 99 ? "99+" : String(n));
+const idSafe = (s: string) => String(s).replace(/[^a-zA-Z0-9_-]/g, "");
 
-declare global {
-    interface Window {
-        SpeechRecognition: any;
-        webkitSpeechRecognition: any;
+const peerIdForPrincipal = (roomId: string, principalText: string) =>
+    `${idSafe(roomId)}-${idSafe(principalText)}`;
+
+const principalFromPeerId = (roomId: string, peerId: string) => {
+    const prefix = `${idSafe(roomId)}-`;
+    return peerId.startsWith(prefix) ? peerId.slice(prefix.length) : peerId;
+};
+
+/** detect touch / coarse pointer */
+const isTouchLike = () => {
+    if (typeof window === "undefined") return false;
+    return (
+        "ontouchstart" in window ||
+        (navigator?.maxTouchPoints ?? 0) > 0 ||
+        !!window.matchMedia?.("(pointer: coarse)")?.matches
+    );
+};
+
+/** ===== WORLD / PLAYER ===== */
+const CANVAS_W = MAP_COLS * TILE;
+const CANVAS_H = MAP_ROWS * TILE;
+
+// sprite size & movement hitbox (AABB)
+const PLAYER = 32;
+const SPEED = 120;
+
+// hitbox offset
+const HITBOX_LEFT = 6;
+const HITBOX_RIGHT = 6;
+const HITBOX_TOP = 2;
+const HITBOX_BOTTOM = 0;
+const HITBOX_W = PLAYER - HITBOX_LEFT - HITBOX_RIGHT;
+const HITBOX_H = PLAYER - HITBOX_TOP - HITBOX_BOTTOM;
+
+const DEFAULT_AUDIO_RADIUS_TILES = 2;
+
+/** UI tokens */
+const LABEL_FONT = "600 12px ui-monospace, SFMono-Regular, Menlo, monospace";
+const LABEL_STROKE = "rgba(0,0,0,0.72)";
+
+/** Smooth camera/zoom config */
+const ZOOM_MAX = 4;
+const ZOOM_STEP = 1.2;
+const ZOOM_LERP = 10;
+const WHEEL_SENS = 0.0015;
+
+/** tile center from AABB (px) */
+const centerTileOf = (xPx: number, yPx: number) => {
+    const cx = xPx + HITBOX_LEFT + HITBOX_W / 2;
+    const cy = yPx + HITBOX_TOP + HITBOX_H / 2;
+    return { col: Math.floor(cx / TILE), row: Math.floor(cy / TILE) };
+};
+
+/** find a safe spawn tile */
+const SPAWN_COL_MIN = 8, SPAWN_COL_MAX = 16;
+const SPAWN_ROW_MIN = 15, SPAWN_ROW_MAX = 22;
+const randInt = (a: number, b: number) => Math.floor(Math.random() * (b - a + 1)) + a;
+
+const pickSpawnTile = () => {
+    for (let i = 0; i < 60; i++) {
+        const col = randInt(SPAWN_COL_MIN, SPAWN_COL_MAX);
+        const row = randInt(SPAWN_ROW_MIN, SPAWN_ROW_MAX);
+        if (!isSolidTile(col, row)) return { col, row };
     }
-}
+    for (let r = SPAWN_ROW_MIN; r <= SPAWN_ROW_MAX; r++) {
+        for (let c = SPAWN_COL_MIN; c <= SPAWN_COL_MAX; c++) {
+            if (!isSolidTile(c, r)) return { col: c, row: r };
+        }
+    }
+    return { col: 12, row: 18 };
+};
 
+const tileSpawnPx = () => {
+    const { col, row } = pickSpawnTile();
+    return {
+        x: col * TILE + Math.floor((TILE - PLAYER) / 2),
+        y: row * TILE + Math.floor((TILE - PLAYER) / 2),
+    };
+};
+
+/** ===== Proximity set (BFS skips solid tiles) ===== */
+const computeAudibleTiles = (cx: number, cy: number, radius: number) => {
+    const tiles = new Set<string>();
+    const seen: boolean[][] = Array.from({ length: MAP_ROWS }, () => Array(MAP_COLS).fill(false));
+    const q: Array<{ x: number; y: number }> = [];
+
+    const push = (x: number, y: number) => {
+        if (x < 0 || y < 0 || x >= MAP_COLS || y >= MAP_ROWS) return;
+        if (seen[y][x]) return;
+        const dCheb = Math.max(Math.abs(x - cx), Math.abs(y - cy));
+        if (dCheb > radius) return;
+        seen[y][x] = true;
+
+        if (isSolidTile(x, y)) return;
+        const rule = audioRuleAt(x, y);
+        if (rule.kind === "room") return;
+
+        tiles.add(`${x},${y}`);
+        q.push({ x, y });
+    };
+
+    push(cx, cy);
+
+    while (q.length) {
+        const { x, y } = q.shift()!;
+        for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+                if (!dx && !dy) continue;
+                const nx = x + dx, ny = y + dy;
+
+                if (dx !== 0 && dy !== 0) {
+                    const blockA = isSolidTile(x + dx, y);
+                    const blockB = isSolidTile(x, y + dy);
+                    if (blockA && blockB) continue;
+                }
+                push(nx, ny);
+            }
+        }
+    }
+
+    return tiles;
+};
+
+/** ===== DOOR - state & helpers ===== */
+const DOOR_SFX_RADIUS_TILES = 1;
+
+const isDoorId = (id: number) => (id === DOOR_OPEN_ID || id === DOOR_CLOSED_ID);
+const doorKey = (c: number, r: number) => `${c},${r}`;
+
+/** ===== Player outfit/anim/speaking ===== */
+type PlayerPos = { x: number; y: number };
+type PosMsg = { t: "pos"; x: number; y: number; moving?: boolean; face?: 1 | -1 };
+type MetaMsg = { t: "meta"; label?: string; outfit?: OutfitSlotsArray };
+type SpinMsg = { t: "spin"; dur?: number };
+
+const BUBBLE_FONT = "13px ui-monospace, SFMono-Regular, Menlo, monospace";
+const BUBBLE_MAX_W = 240;
+const BUBBLE_LINE_H = 16;
+
+const BUBBLE_MIN_MS = 5000;
+const BUBBLE_MAX_MS = 15000;
+const BUBBLE_BASE_MS = 5000;
+const BUBBLE_PER_CHAR_MS = 50;
+const BUBBLE_PER_NEWLINE_MS = 250;
+
+/** DC message union */
+type Msg =
+    | { t: "hello"; peerId: string; principal: string }
+    | { t: "bye"; peerId: string }
+    | PosMsg
+    | { t: "chat"; text: string; ts?: number; from?: string }
+    | { t: "media-refresh"; why?: "mic-on" | "mic-off" | "device" | "manual" }
+    | { t: "door"; col: number; row: number; open: boolean; silent?: boolean }
+    | { t: "door-sync-req" }
+    | MetaMsg
+    | SpinMsg;
+
+const normalizeUsername = (s: string) =>
+    s.replace(/[^\w.-]+/g, "_").trim().slice(0, 24);
+
+const prettyId = (s: string) =>
+    s.length > 16 ? `${s.slice(0, 6)}...${s.slice(-6)}` : s;
+
+const HEAD_BOX = { x: 6, y: 2, w: 20, h: 20 };
+
+/** ===== Main component ===== */
 const Room: React.FC = () => {
-    const { id: roomId } = useParams<{ id: string }>();
+    const { id: rawRoomParam } = useParams<{ id: string }>();
     const navigate = useNavigate();
+    const roomId = (rawRoomParam || "").trim().toLowerCase();
 
-    // ========== HOOKS ==========
-    const {
-        isAuthenticated,
-        user,
-        principalId,
-        login,
-        isLoading: authLoading,
-        error: authError
-    } = useAuth();
+    // auth + backend
+    const { isAuthenticated, principalId, isLoading: authLoading, user } = useAuth() as any;
+    const { getRoom, joinRoom, leaveRoom } = useRoom();
 
-    const {
-        leaveRoom,
-        getRoom,
-        sendSignal,
-        getSignals,
-        clearSignals,
-        isLoading: roomLoading,
-        error: roomError
-    } = useRoom();
+    // logs
+    const [logs, setLogs] = useState<string[]>([]);
+    const log = (s: string) => setLogs((p) => [...p, `[${new Date().toLocaleTimeString()}] ${s}`].slice(-300));
 
-    const {
-        roomData,
-        participants,
-        isHost,
-        isLoading: realtimeLoading,
-        error: realtimeError,
-        stopPolling
-    } = useRealTimeRoom(roomId, principalId);
+    // Connections
+    const peerRef = useRef<Peer | null>(null);
+    const creatingRef = useRef(false);
+    const closingRef = useRef(false);
 
-    const {
-        translate,
-        detectLanguage,
-        isLoading: translationLoading,
-        supportedLanguages
-    } = useTranslation();
+    // datachannels
+    const connsRef = useRef<Map<string, DataConnection>>(new Map());
+    const chatConnsRef = useRef<Map<string, DataConnection>>(new Map());
+    const mediaConnsRef = useRef<Map<string, MediaConnection>>(new Map());
 
-    // ========== WEBRTC REFS ==========
-    const localStream = useRef<MediaStream | null>(null);
-    const localVideoRef = useRef<HTMLVideoElement>(null);
-    const peerConnections = useRef<Map<string, PeerConnectionData>>(new Map());
-    const pendingICECandidates = useRef<Map<string, RTCIceCandidate[]>>(new Map());
-    const signalIntervalRef = useRef<NodeJS.Timeout | null>(null);
-    const remoteVideosContainerRef = useRef<HTMLDivElement>(null);
-    const processedSignals = useRef<Set<string>>(new Set());
-    const previousParticipants = useRef<string[]>([]);
+    /** roster RTC:
+     *  - key: peerId
+     *  - val: principal text
+     */
+    const rosterRef = useRef<Map<string, string>>(new Map());
+    const joinedRef = useRef(false);
 
-    // ========== SPEECH RECOGNITION REFS ==========
-    const speechRecognitionRef = useRef<any>(null);
-    const shouldRestartSpeechRef = useRef(false);
+    // peer handlers
+    const handlersRef = useRef<{
+        onConnection?: (conn: DataConnection) => void;
+        onDisconnected?: () => void;
+        onClose?: () => void;
+        onError?: (e: any) => void;
+        onCall?: (call: MediaConnection) => void;
+    }>({});
 
-    // ========== STATES ==========
-    const [isSignalPolling, setIsSignalPolling] = useState(false);
-    const [loading, setLoading] = useState(false);
-    const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
+    // Mobile joystick toggle
+    const [useJoystick, setUseJoystick] = useState(false);
+    useEffect(() => {
+        const update = () => setUseJoystick(isTouchLike());
+        update();
+        const mql = window.matchMedia?.("(pointer: coarse)");
+        mql?.addEventListener?.("change", update);
+        return () => mql?.removeEventListener?.("change", update);
+    }, []);
 
-    // ========== MEDIA CONTROL STATES ==========
-    const [availableDevices, setAvailableDevices] = useState<{
-        cameras: MediaDeviceInfo[];
-        microphones: MediaDeviceInfo[];
-    }>({
-        cameras: [],
-        microphones: []
-    });
-    const [selectedCameraId, setSelectedCameraId] = useState<string>('');
-    const [selectedMicrophoneId, setSelectedMicrophoneId] = useState<string>('');
-    const [isCameraEnabled, setIsCameraEnabled] = useState(true);
-    const [isMicrophoneEnabled, setIsMicrophoneEnabled] = useState(true);
-    const [isDevicesLoading, setIsDevicesLoading] = useState(false);
-    const [showSettings, setShowSettings] = useState(false);
+    // World state
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const worldRef = useRef<WorldMap | null>(null);
+    const zoomActualRef = useRef(2);
+    const zoomTargetRef = useRef(2);
+    const lastPointerRef = useRef({ x: 0, y: 0 });
 
-    // ========== UI STATES ==========
-    const [showParticipants, setShowParticipants] = useState(false);
-    const [showAITranslate, setShowAITranslate] = useState(false);
+    const setZoomTarget = (z: number) => {
+        const dpr = window.devicePixelRatio || 1;
+        const viewW = (canvasRef.current?.width || Math.floor(window.innerWidth * dpr)) / dpr;
 
-    // ========== AI TRANSLATION STATES ==========
-    const [isTranscribing, setIsTranscribing] = useState(false);
-    const [sourceLanguage, setSourceLanguage] = useState('id-ID');
-    const [targetLanguage, setTargetLanguage] = useState('en-US');
-    const [speechLogs, setSpeechLogs] = useState<SpeechLog[]>([]);
-    const [recognitionActive, setRecognitionActive] = useState(false);
+        const minZoomByWorldX = Math.max(viewW / CANVAS_W, 0.1);
+        const maxZoom = ZOOM_MAX;
 
-    // ========== COMPUTED VALUES ==========
-    const isUserReady = isAuthenticated && user?.username;
+        zoomTargetRef.current = clamp(z, minZoomByWorldX, maxZoom);
+    };
 
-    // ========== MAIN AUTOMATIC WEBRTC FLOW ==========
-    const initializeAutomaticWebRTC = async () => {
-        if (!roomData || !isUserReady) return;
+    const requestZoomIn = () => setZoomTarget(zoomTargetRef.current * ZOOM_STEP);
+    const requestZoomOut = () => setZoomTarget(zoomTargetRef.current / ZOOM_STEP);
 
-        console.log('[AUTO-WEBRTC] Starting automatic WebRTC initialization...');
+    // player pos
+    const meRef = useRef<PlayerPos>(tileSpawnPx());
+    const othersRef = useRef<Record<string, PlayerPos>>({});
+    const keysRef = useRef({ up: false, left: false, down: false, right: false });
+    const lastRef = useRef(performance.now());
+    const sendAccRef = useRef(0);
+    const rafRef = useRef(0);
 
+    // overlay canvas for audio mask
+    const overlayCvsRef = useRef<HTMLCanvasElement | null>(null);
+    const overlayCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+
+    /* ===== Player assets states ===== */
+    const partsRef = useRef<SpriteParts | null>(null);
+    const outfitLibRef = useRef<OutfitLibrary | null>(null);
+    const playerOutfitSlotsRef = useRef<Record<string, OutfitSlotsArray>>({});
+    const playerOutfitPartsRef = useRef<Record<string, OutfitParts | undefined>>({});
+    const outfitVersion = useRef(0);
+
+    const faceDirRef = useRef<Record<string, 1 | -1>>({});
+    const remoteMovingRef = useRef<Record<string, boolean>>({});
+    const lastPosAtRef = useRef<Record<string, number>>({});
+
+    // Spin gesture
+    type ArmSpin = { start: number; dur: number };
+    const ARM_SPIN_MS = 250;
+    const armSpinRef = useRef<Record<string, ArmSpin | undefined>>({});
+
+    const triggerArmSpin = (pid: string, dur = ARM_SPIN_MS) => {
+        armSpinRef.current[pid] = { start: performance.now(), dur };
+    };
+    const getArmSpinOverride = (pid: string, _flipX: boolean, nowMs: number) => {
+        const s = armSpinRef.current[pid];
+        if (!s) return undefined;
+        const t = (nowMs - s.start) / s.dur;
+        if (t >= 1) { delete armSpinRef.current[pid]; return undefined; }
+        const angle = t * Math.PI * 2;
+        return { armFrontRot: angle } as any;
+    };
+
+    // label/name
+    const labelCacheRef = useRef<Record<string, string>>({});
+    const usernameCacheRef = useRef<Record<string, string>>({});
+    const [labelsVersion, setLabelsVersion] = useState(0);
+
+    const usernameFor = (peerId: string) => {
+        if (peerId === myPeerId) {
+            const uname = String(user?.username || "").trim();
+            return uname ? normalizeUsername(uname) : "";
+        }
+        return usernameCacheRef.current[peerId] || "";
+    };
+
+    const displayNameFor = (peerId: string) => {
+        if (peerId === myPeerId) return myLabelRef.current || prettyId(myPeerId);
+        return labelCacheRef.current[peerId] || prettyId(peerId);
+    };
+
+    const isProfileReady = (peerId: string) => {
+        if (peerId === myPeerId) return true;
+
+        const labelOk = !!(labelCacheRef.current[peerId]?.trim());
+        const unameOk = !!(usernameCacheRef.current[peerId]?.trim());
+        return labelOk && unameOk;
+    };
+
+    const resolveRemoteProfile = async (remotePeerId: string) => {
         try {
-            // Step 1: Enumerate devices first
-            if (availableDevices.cameras.length === 0 && availableDevices.microphones.length === 0) {
-                console.log('[AUTO-WEBRTC] Step 1: Enumerating devices...');
-                await enumerateDevices();
-            }
+            const principalTxt = principalFromPeerId(roomId, remotePeerId);
+            const u: any = await canisterService.getUserByPrincipal(Principal.fromText(principalTxt));
 
-            // Step 2: Setup media (camera & microphone)
-            if (!localStream.current) {
-                console.log('[AUTO-WEBRTC] Step 2: Setting up media...');
-                await setupMedia(selectedCameraId, selectedMicrophoneId, isCameraEnabled, isMicrophoneEnabled);
-            }
+            const rawName = String(u?.name || u?.username || "").trim();
+            const label = rawName.replace(/\s+/g, " ").slice(0, 24);
+            if (label) labelCacheRef.current[remotePeerId] = label;
 
-            // Step 3: Start signal polling for automatic responses
-            if (!isSignalPolling) {
-                console.log('[AUTO-WEBRTC] Step 3: Starting signal polling...');
-                startAutomaticSignalPolling();
-            }
+            const uname = String(u?.username || "").trim();
+            if (uname) usernameCacheRef.current[remotePeerId] = normalizeUsername(uname);
 
-            // Step 4: Handle participant changes
-            handleParticipantChanges();
-
-            console.log('[AUTO-WEBRTC] Automatic WebRTC initialization complete!');
-
-        } catch (error) {
-            console.error('[AUTO-WEBRTC] Initialization failed:', error);
-        }
+            setLabelsVersion(v => v + 1);
+            refreshRtcUI();
+        } catch { }
     };
 
-    // ========== AI TRANSLATION FUNCTIONS ==========
-    const initializeSpeechRecognition = () => {
-        if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-            console.warn('Speech Recognition not supported');
-            return;
-        }
+    const myDisplayName = useMemo(() => {
+        const raw = String(user?.name || user?.username || "").trim();
+        return raw.replace(/\s+/g, " ").slice(0, 24);
+    }, [user?.name, user?.username]);
 
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        const recognition = new SpeechRecognition();
+    const myLabelRef = useRef("");
+    useEffect(() => {
+        myLabelRef.current = myDisplayName;
+    }, [myDisplayName]);
 
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = sourceLanguage;
-        recognition.maxAlternatives = 1;
+    const nameReady = !!myDisplayName;
 
-        recognition.onstart = () => {
-            setRecognitionActive(true);
-        };
+    useEffect(() => {
+        broadcastLabel();
+    }, [user?.name, user?.username]);
 
-        recognition.onend = () => {
-            setRecognitionActive(false);
-            if (shouldRestartSpeechRef.current && showAITranslate) {
-                setIsTranscribing(true);
-                if (shouldRestartSpeechRef.current && speechRecognitionRef.current) {
-                    try {
-                        speechRecognitionRef.current.start();
-                    } catch (error) {
-                        console.error('[AI-TRANSLATE] Restart failed:', error);
-                    }
-                }
-            } else {
-                setIsTranscribing(false);
-            }
-        };
+    /* ===== RIGHT SIDEBAR state ===== */
+    const [showSidebar, setShowSidebar] = useState(false);
+    const [participantsReady, setParticipantsReady] = useState<string[]>([]);
+    const [inviteCopied, setInviteCopied] = useState(false);
 
-        recognition.onerror = (event: any) => {
-            console.error('[AI-TRANSLATE] Speech recognition error:', event.error);
-            setRecognitionActive(false);
-        };
-
-        recognition.onresult = async (event: any) => {
-            let finalTranscript = '';
-
-            for (let i = event.resultIndex; i < event.results.length; i++) {
-                const result = event.results[i];
-
-                if (result.isFinal) {
-                    finalTranscript += result[0].transcript;
-                    const confidence = result[0].confidence;
-
-                    if (finalTranscript.trim()) {
-                        await handleSpeechResult(
-                            finalTranscript.trim(),
-                            principalId || 'local',
-                            user?.name || user?.username || 'You',
-                            true,
-                            confidence
-                        );
-                    }
-                }
-            }
-        };
-
-        speechRecognitionRef.current = recognition;
-    };
-
-    const handleSpeechResult = async (
-        text: string,
-        participantId: string,
-        participantName: string,
-        isLocal: boolean,
-        confidence?: number
-    ) => {
-        const logId = `${participantId}-${Date.now()}-${Math.random()}`;
-
-        // Create initial log entry
-        const newLog: SpeechLog = {
-            id: logId,
-            participantId,
-            participantName,
-            originalText: text,
-            timestamp: new Date(),
-            isTranslating: true,
-            isLocal,
-            confidence
-        };
-
-        setSpeechLogs(prev => [newLog, ...prev]);
-
+    // Copy link to clipboard
+    const onInviteClick = async () => {
         try {
-            // Detect language
-            const detectedLang = await detectLanguage(text);
+            const url = `${window.location.origin}/room/${encodeURIComponent(roomId)}`;
+            await navigator.clipboard.writeText(url);
+            setInviteCopied(true);
+            setTimeout(() => setInviteCopied(false), 1500);
+        } catch { }
+    };
 
-            // Translate to target language
-            const translatedText = await translate(text, targetLanguage);
+    /* ===== CHAT state ===== */
+    const [showChat, setShowChat] = useState(false);
+    const [chatInput, setChatInput] = useState("");
+    const [chatLog, setChatLog] = useState<
+        { id: string; fromPeerId: string; label: string; text: string; ts: number; self: boolean }[]
+    >([]);
+    const chatListRef = useRef<HTMLDivElement | null>(null);
+    const chatInputRef = useRef<HTMLInputElement | null>(null);
+    const typingChatRef = useRef(false);
 
-            // Update log with translation
-            setSpeechLogs(prev => prev.map(log =>
-                log.id === logId
-                    ? {
-                        ...log,
-                        translatedText,
-                        detectedLanguage: detectedLang,
-                        isTranslating: false
+    const scrollChatToBottom = () => {
+        const el = chatListRef.current; if (!el) return;
+        el.scrollTop = el.scrollHeight;
+    };
+    useEffect(() => { scrollChatToBottom(); }, [chatLog.length, showChat]);
+    useEffect(() => { if (showChat) setTimeout(() => chatInputRef.current?.focus(), 60); }, [showChat]);
+
+    // Chat bubble state
+    const chatBubbleRef = useRef<Record<string, { text: string; until: number }>>({});
+    const chatTalkUntilRef = useRef<Record<string, number>>({});
+
+    const bubbleDurationFor = (text: string) => {
+        const clean = String(text ?? "");
+        const len = clean.length;
+        const nl = (clean.match(/\n/g)?.length ?? 0);
+        const ms = BUBBLE_BASE_MS + BUBBLE_PER_CHAR_MS * Math.min(len, 240) + BUBBLE_PER_NEWLINE_MS * nl;
+        return clamp(ms, BUBBLE_MIN_MS, BUBBLE_MAX_MS);
+    };
+
+    const wrapText = (ctx: CanvasRenderingContext2D, text: string, maxW: number): string[] => {
+        const lines: string[] = [];
+        const paragraphs = String(text ?? "").split(/\n/);
+        for (const para of paragraphs) {
+            const words = para.split(/\s+/).filter(Boolean);
+            if (words.length === 0) { lines.push(""); continue; }
+            let cur = "";
+            for (const w of words) {
+                const test = cur ? cur + " " + w : w;
+                if (ctx.measureText(test).width <= maxW) { cur = test; continue; }
+                if (!cur) {
+                    let chunk = "";
+                    for (const ch of w) {
+                        const trial = chunk + ch;
+                        if (ctx.measureText(trial).width <= maxW) chunk = trial;
+                        else { if (chunk) lines.push(chunk); chunk = ch; }
                     }
-                    : log
-            ));
-
-            console.log('[AI-TRANSLATE] Translation completed:', {
-                original: text,
-                translated: translatedText,
-                language: detectedLang
-            });
-
-        } catch (error) {
-            console.error('[AI-TRANSLATE] Translation failed:', error);
-
-            // Update log with error
-            setSpeechLogs(prev => prev.map(log =>
-                log.id === logId
-                    ? {
-                        ...log,
-                        translatedText: 'Translation failed',
-                        isTranslating: false
-                    }
-                    : log
-            ));
-        }
-    };
-
-    const startAITranscription = () => {
-        if (!speechRecognitionRef.current) {
-            initializeSpeechRecognition();
-        }
-
-        if (speechRecognitionRef.current && !recognitionActive) {
-            try {
-                shouldRestartSpeechRef.current = true;
-                speechRecognitionRef.current.start();
-                setIsTranscribing(true);
-                console.log('[AI-TRANSLATE] Starting transcription...');
-            } catch (error) {
-                console.error('[AI-TRANSLATE] Failed to start:', error);
-            }
-        }
-    };
-
-    const stopAITranscription = () => {
-        if (speechRecognitionRef.current) {
-            shouldRestartSpeechRef.current = false;
-            speechRecognitionRef.current.stop();
-            setIsTranscribing(false);
-        }
-    };
-
-    const clearSpeechLogs = () => {
-        setSpeechLogs([]);
-    };
-
-    const getLanguageName = (code: string): string => {
-        const langMap: Record<string, string> = {
-            'id-ID': '🇮🇩 Indonesian',
-            'en-US': '🇺🇸 English (US)',
-            'en-GB': '🇬🇧 English (UK)',
-            'ja-JP': '🇯🇵 Japanese',
-            'ko-KR': '🇰🇷 Korean',
-            'zh-CN': '🇨🇳 Chinese',
-            'zh-TW': '🇹🇼 Chinese (TW)',
-            'es-ES': '🇪🇸 Spanish',
-            'fr-FR': '🇫🇷 French',
-            'de-DE': '🇩🇪 German',
-            'pt-BR': '🇧🇷 Portuguese',
-            'ru-RU': '🇷🇺 Russian',
-            'ar-SA': '🇸🇦 Arabic',
-            'hi-IN': '🇮🇳 Hindi',
-            'th-TH': '🇹🇭 Thai',
-            'vi-VN': '🇻🇳 Vietnamese',
-            'tr-TR': '🇹🇷 Turkish',
-        };
-
-        return langMap[code] || code;
-    };
-
-    // ========== CLEANUP FUNCTIONS ==========
-    const cleanupAllPeerConnections = () => {
-        console.log('[CLEANUP] Cleaning up all peer connections...');
-
-        // Stop signal polling
-        stopSignalPolling();
-
-        // Close all peer connections
-        peerConnections.current.forEach((peerData, principalId) => {
-            if (peerData.pc) {
-                peerData.pc.close();
-                console.log(`[CLEANUP] Closed peer connection for ${principalId}`);
-            }
-
-            // Stop remote stream
-            if (peerData.remoteStream) {
-                peerData.remoteStream.getTracks().forEach(track => track.stop());
-            }
-
-            // Safe video element removal
-            if (peerData.videoElement) {
-                try {
-                    const parentElement = peerData.videoElement.parentElement;
-                    if (parentElement && parentElement.parentNode) {
-                        parentElement.parentNode.removeChild(parentElement);
-                    }
-                } catch (error) {
-                    console.warn(`[CLEANUP] Could not remove video element for ${principalId}:`, error);
+                    if (chunk) lines.push(chunk);
+                } else {
+                    lines.push(cur); cur = w;
                 }
             }
+            if (cur) lines.push(cur);
+        }
+        return lines;
+    };
+
+    // identity
+    const myPrincipalTxt = useMemo(() => principalId || "anonymous", [principalId]);
+    const myPeerId = useMemo(() => peerIdForPrincipal(roomId, myPrincipalTxt), [roomId, myPrincipalTxt]);
+
+    /* ===== RTC roster UI ===== */
+    const refreshRtcUI = () => {
+        const peers = Array.from(rosterRef.current.keys()).sort((a, b) => {
+            if (a === myPeerId) return -1;
+            if (b === myPeerId) return 1;
+            return a.localeCompare(b);
         });
 
-        // Clear all maps
-        peerConnections.current.clear();
-        pendingICECandidates.current.clear();
-        processedSignals.current.clear();
-        setConnectedPeers([]);
-
-        console.log('[CLEANUP] All peer connections cleanup complete');
+        const readyOnly = peers.filter(isProfileReady);
+        setParticipantsReady(readyOnly);
     };
 
-    const cleanupPeerConnection = (targetPrincipal: string) => {
-        console.log(`[CLEANUP] Cleaning up connection for ${targetPrincipal}...`);
-
-        const peerData = peerConnections.current.get(targetPrincipal);
-        if (peerData) {
-            if (peerData.pc) {
-                peerData.pc.close();
-            }
-            if (peerData.remoteStream) {
-                peerData.remoteStream.getTracks().forEach(track => track.stop());
-            }
-
-            // ENHANCED VIDEO ELEMENT REMOVAL
-            const videoWrapper = document.getElementById(`video-wrapper-${targetPrincipal}`);
-            if (videoWrapper && videoWrapper.parentNode) {
-                videoWrapper.parentNode.removeChild(videoWrapper);
-                console.log(`[CLEANUP] Removed video wrapper for ${targetPrincipal}`);
-            }
-        }
-
-        peerConnections.current.delete(targetPrincipal);
-        pendingICECandidates.current.delete(targetPrincipal);
-
-        setConnectedPeers(prev => prev.filter(p => p !== targetPrincipal));
-
-        console.log(`[CLEANUP] Connection cleanup complete for ${targetPrincipal}`);
+    const ensureSelfInRoster = () => {
+        rosterRef.current.set(myPeerId, myPrincipalTxt);
+        refreshRtcUI();
     };
 
-    const cleanupLocalMedia = () => {
-        console.log('[CLEANUP] Cleaning up local media...');
-
-        if (localStream.current) {
-            localStream.current.getTracks().forEach(track => track.stop());
-            localStream.current = null;
-        }
-
-        if (localVideoRef.current) {
-            localVideoRef.current.srcObject = null;
-        }
-
-        console.log('[CLEANUP] Local media cleanup complete');
+    const broadcastPos = () => {
+        const movingNow = !!(keysRef.current.left || keysRef.current.right || keysRef.current.up || keysRef.current.down);
+        const face = faceDirRef.current[myPeerId] ?? 1;
+        const msg: PosMsg = { t: "pos", x: meRef.current.x, y: meRef.current.y, moving: movingNow, face };
+        for (const [, c] of connsRef.current) if (c.open) { try { c.send(msg); } catch { } }
     };
 
-    // ========== SYMMETRIC PARTICIPANT HANDLING ==========
-    const handleParticipantChanges = () => {
-        if (!principalId || !roomData) return;
+    const addChatMessage = (fromPeerId: string, text: string, ts = Date.now(), self = false) => {
+        const label = displayNameFor(fromPeerId);
+        const item = {
+            id: `${ts}-${fromPeerId}-${Math.random().toString(36).slice(2, 7)}`,
+            fromPeerId,
+            label,
+            text,
+            ts,
+            self,
+        };
+        setChatLog((prev) => [...prev, item].slice(-400));
+        const dur = bubbleDurationFor(text);
+        const now = performance.now();
+        chatBubbleRef.current[fromPeerId] = { text, until: now + dur };
+        chatTalkUntilRef.current[fromPeerId] = now + Math.min(dur, 5000);
+    };
 
-        const otherParticipants = roomData.participants.filter(p =>
-            p && typeof p.toText === 'function' && p.toText() !== principalId
+    const sendChat = (textRaw: string) => {
+        let text = String(textRaw ?? "")
+            .replace(/\r/g, "")
+            .replace(/[ \t]+/g, " ")
+            .replace(/\n{3,}/g, "\n\n")
+            .trim();
+        if (text.length > 240) text = text.slice(0, 240);
+        if (!text) return;
+        const ts = Date.now();
+        const wire: Msg = { t: "chat", text, ts, from: myPeerId };
+        let sent = false;
+        for (const [, c] of chatConnsRef.current) {
+            if (c.open) { try { c.send(wire); sent = true; } catch { } }
+        }
+        if (!sent) {
+            for (const [, c] of connsRef.current) { if (c.open) { try { c.send(wire); } catch { } } }
+        }
+        addChatMessage(myPeerId, text, ts, true);
+        setChatInput("");
+    };
+
+    const handleInboundChat = (remotePeerId: string, payload: any) => {
+        if (!payload || payload.t !== "chat") return;
+        const from = typeof payload.from === "string" ? payload.from : remotePeerId;
+        const ts = typeof payload.ts === "number" ? payload.ts : Date.now();
+        const text = String(payload.text ?? "");
+        addChatMessage(from, text, ts, false);
+    };
+
+    // ===== Outfit editor =====
+    const [showOutfit, setShowOutfit] = useState(false);
+    const [mySlots, setMySlots] = useState<OutfitSlotsArray>(DEFAULT_OUTFIT);
+    const [activeSlot, setActiveSlot] = useState<string>(OUTFIT_SLOT_ORDER[0]);
+    const previewRef = useRef<HTMLCanvasElement | null>(null);
+
+    // Outfit canvas
+    useEffect(() => {
+        if (!showOutfit) return;
+        const cvs = previewRef.current;
+        const parts = partsRef.current;
+        const lib = outfitLibRef.current;
+        if (!cvs || !parts || !lib) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const W = 160, H = 160;
+        const ctx = cvs.getContext("2d")!;
+        cvs.width = W * dpr; cvs.height = H * dpr;
+        cvs.style.width = W + "px"; cvs.style.height = H + "px";
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.imageSmoothingEnabled = false;
+        ctx.clearRect(0, 0, W, H);
+
+        const active = buildActiveOutfit(lib, mySlots);
+        const scale = 3;
+        const spriteW = PLAYER * scale;
+        const x = Math.floor(W / 2 - spriteW / 2);
+        const y = Math.floor(H / 2 - spriteW / 2) + 8;
+
+        drawPlayerSprite(
+            ctx, parts, x, y, scale,
+            { phase: 0, amp: 0 }, false,
+            active,
+            { speaking: false, talkBlink: false }
         );
+    }, [mySlots, showOutfit]);
 
-        const currentPrincipalTexts = otherParticipants.map(p => p.toText());
-        const previousPrincipalTexts = previousParticipants.current;
+    // Original slots before edit
+    const originalSlotsRef = useRef<OutfitSlotsArray>(DEFAULT_OUTFIT);
+    const shouldRevertRef = useRef(false);
 
-        console.log(`[PARTICIPANTS] Current others:`, currentPrincipalTexts);
-        console.log(`[PARTICIPANTS] Previous others:`, previousPrincipalTexts);
-
-        // Case 1: No other participants - cleanup all connections
-        if (currentPrincipalTexts.length === 0) {
-            console.log('[PARTICIPANTS] No other participants - cleaning up all connections');
-            cleanupAllPeerConnections();
-            previousParticipants.current = currentPrincipalTexts;
-            return;
-        }
-
-        // Case 2: Remove connections for participants who left
-        const participantsWhoLeft = previousPrincipalTexts.filter(p => !currentPrincipalTexts.includes(p));
-        participantsWhoLeft.forEach(leftPrincipal => {
-            console.log(`[PARTICIPANTS] Participant left: ${leftPrincipal}`);
-            cleanupPeerConnection(leftPrincipal);
-        });
-
-        // Case 3: Handle NEW participants joining (BIDIRECTIONAL APPROACH)
-        const newParticipants = currentPrincipalTexts.filter(p => !previousPrincipalTexts.includes(p));
-
-        if (newParticipants.length > 0) {
-            console.log(`[PARTICIPANTS] NEW participants detected:`, newParticipants);
-
-            // CRITICAL FIX: Both existing and new participants establish connections
-            newParticipants.forEach(async (newPrincipalText) => {
-                console.log(`[PARTICIPANTS] I (existing user) am establishing connection with NEW user: ${newPrincipalText}`);
-                await handleNewParticipantConnection(newPrincipalText);
-            });
-
-            // Also notify that we detected new participants - this will trigger them to connect to us too
-            console.log(`[PARTICIPANTS] Detected ${newParticipants.length} new participants. They should also connect to existing users.`);
-        }
-
-        // Case 4: Ensure all current participants have connections (safety check)
-        currentPrincipalTexts.forEach(async (otherPrincipalText) => {
-            if (!peerConnections.current.has(otherPrincipalText)) {
-                console.log(`[PARTICIPANTS] Creating missing connection to: ${otherPrincipalText}`);
-                await handleNewParticipantConnection(otherPrincipalText);
-            }
-        });
-
-        // Update previous participants
-        previousParticipants.current = currentPrincipalTexts;
+    const openOutfit = () => {
+        const applied = playerOutfitSlotsRef.current[myPeerId] || mySlots;
+        originalSlotsRef.current = (applied.slice() as OutfitSlotsArray);
+        setMySlots(originalSlotsRef.current);
+        shouldRevertRef.current = true;
+        setShowOutfit(true);
     };
 
-    // ========== SYMMETRIC CONNECTION ESTABLISHMENT ==========
-    const handleNewParticipantConnection = async (targetPrincipalText: string) => {
-        try {
-            console.log(`[BIDIRECTIONAL] Establishing connection with ${targetPrincipalText}...`);
-            console.log(`[BIDIRECTIONAL] My principal: ${principalId}, Target: ${targetPrincipalText}`);
+    const closeOutfit = (commit = false) => {
+        if (!commit && shouldRevertRef.current) setMySlots(originalSlotsRef.current);
+        shouldRevertRef.current = false;
+        setShowOutfit(false);
+    };
 
-            // Create peer connection if it doesn't exist
-            if (!peerConnections.current.has(targetPrincipalText)) {
-                console.log(`[BIDIRECTIONAL] Creating new peer connection for ${targetPrincipalText}`);
-                await createPeerConnectionForUser(targetPrincipalText);
-            } else {
-                console.log(`[BIDIRECTIONAL] Peer connection already exists for ${targetPrincipalText}`);
-            }
+    const onCancelOutfit = () => closeOutfit(false);
 
-            // BIDIRECTIONAL OFFER STRATEGY:
-            // Both users attempt to connect, but only the one with smaller principal sends offer
-            // This ensures EVERY pair of users has a connection
-            const shouldIOffer = principalId < targetPrincipalText;
-
-            if (shouldIOffer) {
-                console.log(`[BIDIRECTIONAL] I WILL send offer to ${targetPrincipalText} (I have smaller principal: ${principalId} < ${targetPrincipalText})`);
-
-                // Add staggered delay to prevent signal collision
-                const delay = Math.random() * 1500 + 1000; // 1-2.5 seconds
-                setTimeout(async () => {
-                    const peerData = peerConnections.current.get(targetPrincipalText);
-                    if (peerData && peerData.pc.signalingState === 'stable') {
-                        console.log(`[BIDIRECTIONAL] Now sending offer to ${targetPrincipalText} after delay`);
-                        await sendOfferToUser(targetPrincipalText);
-                    } else {
-                        console.log(`[BIDIRECTIONAL] Peer not ready for offer: ${targetPrincipalText}, state: ${peerData?.pc.signalingState}`);
-
-                        // Retry after a bit if peer connection exists but not stable
-                        if (peerData) {
-                            setTimeout(async () => {
-                                if (peerData.pc.signalingState === 'stable') {
-                                    console.log(`[BIDIRECTIONAL] Retrying offer to ${targetPrincipalText}`);
-                                    await sendOfferToUser(targetPrincipalText);
-                                }
-                            }, 2000);
-                        }
-                    }
-                }, delay);
-            } else {
-                console.log(`[BIDIRECTIONAL] I will WAIT for offer from ${targetPrincipalText} (they have smaller principal: ${targetPrincipalText} < ${principalId})`);
-                console.log(`[BIDIRECTIONAL] Expected: ${targetPrincipalText} should send offer to me (${principalId})`);
-            }
-
-        } catch (error) {
-            console.error(`[BIDIRECTIONAL] Error establishing connection with ${targetPrincipalText}:`, error);
-
-            // Retry on error
-            setTimeout(() => {
-                console.log(`[BIDIRECTIONAL] Retrying connection with ${targetPrincipalText} after error`);
-                handleNewParticipantConnection(targetPrincipalText);
-            }, 3000);
+    // Apply to self & broadcast
+    const broadcastLabel = () => {
+        const myLabel = myLabelRef.current;
+        if (!myLabel) return;
+        for (const [, c] of connsRef.current) {
+            if (c.open) { try { c.send({ t: "meta", label: myLabel } as MetaMsg); } catch { } }
         }
     };
 
-    // ========== DEVICE ENUMERATION AND MANAGEMENT ==========
-    const enumerateDevices = async () => {
-        try {
-            setIsDevicesLoading(true);
-            console.log('[DEVICES] Enumerating media devices...');
-
-            // Request permissions first to get device labels
-            await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-
-            const devices = await navigator.mediaDevices.enumerateDevices();
-
-            const cameras = devices.filter(device => device.kind === 'videoinput');
-            const microphones = devices.filter(device => device.kind === 'audioinput');
-
-            console.log('[DEVICES] Found cameras:', cameras.length);
-            console.log('[DEVICES] Found microphones:', microphones.length);
-
-            setAvailableDevices({ cameras, microphones });
-
-            // Set default devices if not already selected
-            if (!selectedCameraId && cameras.length > 0) {
-                setSelectedCameraId(cameras[0].deviceId);
+    const broadcastOutfit = () => {
+        const slots = playerOutfitSlotsRef.current[myPeerId] || DEFAULT_OUTFIT;
+        for (const [, c] of connsRef.current) {
+            if (c.open) {
+                try { c.send({ t: "meta", outfit: slots } as MetaMsg); } catch { }
             }
-            if (!selectedMicrophoneId && microphones.length > 0) {
-                setSelectedMicrophoneId(microphones[0].deviceId);
-            }
-
-        } catch (error) {
-            console.error('[DEVICES] Error enumerating devices:', error);
-        } finally {
-            setIsDevicesLoading(false);
         }
     };
 
-    // ========== MEDIA SETUP ==========
-    const setupMedia = async (
-        cameraId?: string,
-        microphoneId?: string,
-        enableCamera: boolean = true,
-        enableMicrophone: boolean = true
-    ) => {
+    const onApplyOutfit = async () => {
         try {
-            console.log('[MEDIA] Requesting camera & mic...');
-            console.log('[MEDIA] - Camera ID:', cameraId || 'default');
-            console.log('[MEDIA] - Microphone ID:', microphoneId || 'default');
-            console.log('[MEDIA] - Camera enabled:', enableCamera);
-            console.log('[MEDIA] - Microphone enabled:', enableMicrophone);
+            await canisterService.setMyOutfit(mySlots);
+        } catch { }
 
-            // Stop existing stream
-            if (localStream.current) {
-                localStream.current.getTracks().forEach(track => track.stop());
+        setOutfitSlotsFor(myPeerId, mySlots);
+        broadcastOutfit();
+        closeOutfit(true);
+    };
+
+    const recomputeAllOutfits = () => {
+        const ids = Object.keys(playerOutfitSlotsRef.current);
+        for (const pid of ids) {
+            recomputeOutfitFor(pid);
+        }
+        outfitVersion.current++;
+    };
+
+    useEffect(() => {
+        (async () => {
+            if (!principalId) return;
+            try {
+                const slots = await canisterService.getUserOutfit(Principal.fromText(principalId));
+                const norm = normalizeSlots(slots);
+                setMySlots(norm);
+                setOutfitSlotsFor(myPeerId, norm);
+                broadcastOutfit();
+            } catch { }
+        })();
+    }, [principalId, myPeerId]);
+
+    // Mic gate
+    const [needsMicGate, setNeedsMicGate] = useState(true);
+    const [preJoinError, setPreJoinError] = useState<string | null>(null);
+    const shouldRenderGate = needsMicGate && !authLoading && isAuthenticated && !!principalId;
+
+    // Avatar preview on the lobby
+    const prePreviewRef = useRef<HTMLCanvasElement | null>(null);
+
+    // Pre-join avatar preview canvas
+    useEffect(() => {
+        if (!shouldRenderGate) return;
+        const cvs = prePreviewRef.current;
+        const parts = partsRef.current;
+        const lib = outfitLibRef.current;
+        if (!cvs || !parts || !lib) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const W = 220, H = 220;
+        const ctx = cvs.getContext("2d")!;
+        cvs.width = W * dpr; cvs.height = H * dpr;
+        cvs.style.width = W + "px"; cvs.style.height = H + "px";
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.imageSmoothingEnabled = false;
+
+        ctx.clearRect(0, 0, W, H);
+
+        const slots = playerOutfitSlotsRef.current[myPeerId] || mySlots;
+        const active = buildActiveOutfit(lib, slots);
+
+        const scale = 4;
+        const spriteW = PLAYER * scale;
+        const x = Math.floor(W / 2 - spriteW / 2);
+        const y = Math.floor(H / 2 - spriteW / 2) + 12;
+
+        drawPlayerSprite(
+            ctx, parts, x, y, scale,
+            { phase: 0, amp: 0 },
+            false,
+            active,
+            { speaking: false, talkBlink: false }
+        );
+    }, [shouldRenderGate, myPeerId, mySlots]);
+
+    const handlePreJoin = async () => {
+        setPreJoinError(null);
+        try {
+            await ensureAudioCtx()?.resume();
+
+            const stream = await acquireMic(undefined);
+            if (!stream) {
+                throw new Error("Microphone permission is required to join.");
             }
 
+            micOnRef.current = true;
+            setMicOn(true);
+            ensureSilentOut();
+            tryPlayAllRemote();
+            setNeedsMicGate(false);
+        } catch (e: any) {
+            setPreJoinError(e?.message || String(e));
+        }
+    };
+
+
+    /** ===== MEDIA (audio) ===== */
+    const localStreamRef = useRef<MediaStream | null>(null);
+    const micOnRef = useRef(false);
+    const [micOn, setMicOn] = useState(false);
+    const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
+    const [selectedMicId, setSelectedMicId] = useState<string>("");
+    const [showMicSettings, setShowMicSettings] = useState(false);
+
+    const remoteAudiosRef = useRef<Record<string, HTMLAudioElement | null>>({});
+    const remoteUserMutedRef = useRef<Record<string, boolean>>({});
+
+    // WebAudio (VAD & util)
+    const audioCtxRef = useRef<AudioContext | null>(null);
+    const silentOutRef = useRef<MediaStream | null>(null);
+
+    const remoteAnalyserRef = useRef<Record<string, AnalyserNode | null>>({});
+    const remoteSourceRef = useRef<Record<string, MediaStreamAudioSourceNode | null>>({});
+    const remoteLevelRef = useRef<Record<string, number>>({});
+
+    const localAnalyserRef = useRef<AnalyserNode | null>(null);
+    const localSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+    const localLevelRef = useRef(0);
+
+    /** speaking VAD */
+    const speakingRef = useRef<Record<string, boolean>>({});
+    const lastLoudAtRef = useRef<Record<string, number>>({});
+    const lastLoudAtSelfRef = useRef<number>(0);
+    const VAD_HOLD_MS = 200;
+    const BLINK_MS = 200;
+    const talkBlinkRef = useRef<Record<string, boolean>>({});
+    const lastBlinkAtRef = useRef<Record<string, number>>({});
+
+    const SPK_THRESHOLD = 0.02;
+
+    /** AudioContext helper */
+    const ensureAudioCtx = () => {
+        if (!audioCtxRef.current) {
+            const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
+            audioCtxRef.current = new AC();
+        }
+        return audioCtxRef.current!;
+    };
+
+    /** Create a truly silent outbound stream (so we can be recvonly/bi-dir even if mic never on) */
+    const ensureSilentOut = (): MediaStream | null => {
+        try {
+            if (silentOutRef.current) return silentOutRef.current;
+            const ctx = ensureAudioCtx();
+            const src = (ctx as any).createConstantSource ? (ctx as any).createConstantSource() : ctx.createOscillator();
+            const gain = ctx.createGain();
+            const dest = ctx.createMediaStreamDestination();
+            gain.gain.value = 0;
+            src.connect(gain).connect(dest);
+            src.start?.();
+            silentOutRef.current = dest.stream;
+            return silentOutRef.current;
+        } catch {
+            return null;
+        }
+    };
+
+    /** Outbound stream policy:
+     *  - if mic ON -> real mic
+     *  - else      -> silent stream
+     */
+    const getOutboundStream = (): MediaStream | null => {
+        if (micOnRef.current && localStreamRef.current) return localStreamRef.current;
+        return ensureSilentOut();
+    };
+
+    /** VAD helpers */
+    const computeLevel = (an: AnalyserNode | null) => {
+        if (!an) return 0;
+        const buf = new Float32Array(an.fftSize);
+        try {
+            an.getFloatTimeDomainData(buf);
+            let sum = 0;
+            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+            return Math.sqrt(sum / buf.length);
+        } catch { return 0; }
+    };
+
+    const attachLocalAnalyser = (stream: MediaStream) => {
+        try {
+            const ctx = ensureAudioCtx();
+            detachLocalAnalyser();
+            const src = ctx.createMediaStreamSource(stream);
+            const an = ctx.createAnalyser();
+            an.fftSize = 512;
+            src.connect(an);
+            localSourceRef.current = src;
+            localAnalyserRef.current = an;
+        } catch { }
+    };
+
+    const detachLocalAnalyser = () => {
+        try { localSourceRef.current?.disconnect(); } catch { }
+        localSourceRef.current = null;
+        localAnalyserRef.current = null;
+        localLevelRef.current = 0;
+    };
+
+    const attachRemoteAnalyser = (pid: string, stream: MediaStream) => {
+        try {
+            const ctx = ensureAudioCtx();
+            try { remoteSourceRef.current[pid]?.disconnect(); } catch { }
+            const src = ctx.createMediaStreamSource(stream);
+            const an = ctx.createAnalyser();
+            an.fftSize = 512;
+            src.connect(an);
+            remoteSourceRef.current[pid] = src;
+            remoteAnalyserRef.current[pid] = an;
+        } catch {
+            remoteSourceRef.current[pid] = null;
+            remoteAnalyserRef.current[pid] = null;
+        }
+    };
+
+    /** Device list */
+    const refreshMics = async () => {
+        try {
+            const list = await navigator.mediaDevices.enumerateDevices();
+            const ins = list.filter((d) => d.kind === "audioinput");
+            setMics(ins);
+            if (!selectedMicId && ins[0]?.deviceId) setSelectedMicId(ins[0].deviceId);
+        } catch { }
+    };
+    useEffect(() => { void refreshMics(); }, []);
+    useEffect(() => {
+        const onDev = () => void refreshMics();
+        navigator.mediaDevices?.addEventListener?.("devicechange", onDev);
+        return () => navigator.mediaDevices?.removeEventListener?.("devicechange", onDev);
+    }, []);
+
+
+    /** Acquire/close mic */
+    const acquireMic = async (deviceId?: string) => {
+        try {
             const constraints: MediaStreamConstraints = {
-                video: enableCamera ? {
-                    deviceId: cameraId ? { exact: cameraId } : undefined,
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 },
-                    frameRate: { ideal: 30 }
-                } : false,
-                audio: enableMicrophone ? {
-                    deviceId: microphoneId ? { exact: microphoneId } : undefined,
+                audio: {
+                    deviceId: deviceId ? { exact: deviceId } : undefined,
                     echoCancellation: true,
                     noiseSuppression: true,
-                    autoGainControl: true
-                } : false
+                    autoGainControl: true,
+                } as MediaTrackConstraints,
             };
-
             const stream = await navigator.mediaDevices.getUserMedia(constraints);
-            localStream.current = stream;
-
-            // VERIFY LOCAL STREAM
-            console.log('[MEDIA] Got local stream:');
-            console.log('[MEDIA] - Stream active:', stream.active);
-            console.log('[MEDIA] - Total tracks:', stream.getTracks().length);
-
-            stream.getTracks().forEach((track, index) => {
-                console.log(`[MEDIA] - Track ${index}: ${track.kind}, enabled: ${track.enabled}, readyState: ${track.readyState}`);
-            });
-
-            if (localVideoRef.current) {
-                localVideoRef.current.srcObject = stream;
-                console.log('[MEDIA] Set local video source');
-            }
-
-            // UPDATE TRACKS IN EXISTING PEER CONNECTIONS
-            await updateTracksInPeerConnections(stream);
-
-        } catch (err) {
-            console.error('[MEDIA] Error:', err);
-            alert(`Failed to access media devices: ${err instanceof Error ? err.message : 'Unknown error'}`);
-        }
-    };
-
-    // ========== UPDATE TRACKS IN PEER CONNECTIONS ==========
-    const updateTracksInPeerConnections = async (newStream: MediaStream) => {
-        console.log('[MEDIA] Updating tracks in existing peer connections...');
-
-        for (const [targetPrincipal, peerData] of peerConnections.current) {
-            console.log(`[MEDIA] Updating tracks for connection: ${targetPrincipal}`);
-
-            try {
-                // ENHANCED TRACK REPLACEMENT STRATEGY
-                const senders = peerData.pc.getSenders();
-
-                // Replace tracks instead of removing/adding to avoid renegotiation
-                for (const sender of senders) {
-                    if (sender.track) {
-                        const trackKind = sender.track.kind;
-                        const newTrack = newStream.getTracks().find(track => track.kind === trackKind);
-
-                        if (newTrack) {
-                            try {
-                                await sender.replaceTrack(newTrack);
-                                console.log(`[MEDIA] Replaced ${trackKind} track for ${targetPrincipal}`);
-                            } catch (replaceError) {
-                                console.warn(`[MEDIA] Replace track failed for ${trackKind}, falling back to remove/add:`, replaceError);
-
-                                // Fallback: remove and add track
-                                peerData.pc.removeTrack(sender);
-                                peerData.pc.addTrack(newTrack, newStream);
-                                console.log(`[MEDIA] Fallback: Removed and added ${trackKind} track for ${targetPrincipal}`);
-                            }
-                        } else {
-                            // Track kind not available in new stream (e.g., camera turned off)
-                            peerData.pc.removeTrack(sender);
-                            console.log(`[MEDIA] Removed ${trackKind} track for ${targetPrincipal} (not available in new stream)`);
-                        }
-                    }
-                }
-
-                // Add any new tracks that don't have senders yet
-                newStream.getTracks().forEach(track => {
-                    const existingSender = peerData.pc.getSenders().find(sender =>
-                        sender.track && sender.track.kind === track.kind
-                    );
-
-                    if (!existingSender) {
-                        peerData.pc.addTrack(track, newStream);
-                        console.log(`[MEDIA] Added new ${track.kind} track to ${targetPrincipal}`);
-                    }
-                });
-
-                // ONLY RENEGOTIATE IF NECESSARY (when adding/removing tracks, not replacing)
-                const needsRenegotiation = senders.length !== newStream.getTracks().length;
-
-                if (needsRenegotiation && peerData.pc.signalingState === 'stable') {
-                    console.log(`[MEDIA] Renegotiating connection with ${targetPrincipal}...`);
-
-                    const offer = await peerData.pc.createOffer();
-                    await peerData.pc.setLocalDescription(offer);
-
-                    const signal: Signal = {
-                        from: Principal.fromText(principalId),
-                        to: Principal.fromText(targetPrincipal),
-                        kind: 'offer',
-                        data: JSON.stringify(offer)
-                    };
-
-                    await sendSignal(roomId!, signal);
-                    console.log(`[MEDIA] Sent renegotiation offer to ${targetPrincipal}`);
-                } else {
-                    console.log(`[MEDIA] Track replacement completed for ${targetPrincipal} without renegotiation`);
-                }
-
-            } catch (error) {
-                console.error(`[MEDIA] Error updating tracks for ${targetPrincipal}:`, error);
-            }
-        }
-    };
-
-    // ========== MEDIA CONTROL FUNCTIONS ==========
-    const handleCameraChange = async (cameraId: string) => {
-        console.log('[CONTROLS] Changing camera to:', cameraId);
-        setSelectedCameraId(cameraId);
-
-        try {
-            await setupMedia(cameraId, selectedMicrophoneId, isCameraEnabled, isMicrophoneEnabled);
-        } catch (error) {
-            console.error('[CONTROLS] Error switching camera:', error);
-        }
-    };
-
-    const handleMicrophoneChange = async (microphoneId: string) => {
-        console.log('[CONTROLS] Changing microphone to:', microphoneId);
-        setSelectedMicrophoneId(microphoneId);
-
-        try {
-            await setupMedia(selectedCameraId, microphoneId, isCameraEnabled, isMicrophoneEnabled);
-        } catch (error) {
-            console.error('[CONTROLS] Error switching microphone:', error);
-        }
-    };
-
-    const toggleCamera = async () => {
-        const newCameraState = !isCameraEnabled;
-        console.log('[CONTROLS] Toggling camera:', newCameraState ? 'ON' : 'OFF');
-        setIsCameraEnabled(newCameraState);
-
-        if (localStream.current) {
-            const videoTracks = localStream.current.getVideoTracks();
-
-            if (videoTracks.length > 0) {
-                videoTracks.forEach(track => {
-                    track.enabled = newCameraState;
-                });
-
-                // Update track in peer connections
-                for (const [targetPrincipal, peerData] of peerConnections.current) {
-                    const senders = peerData.pc.getSenders();
-                    const videoSender = senders.find(sender => sender.track && sender.track.kind === 'video');
-
-                    if (videoSender && videoSender.track) {
-                        videoSender.track.enabled = newCameraState;
-                        console.log(`[CONTROLS] Updated video track enabled state for ${targetPrincipal}: ${newCameraState}`);
-                    }
-                }
-            } else if (newCameraState) {
-                await setupMedia(selectedCameraId, selectedMicrophoneId, newCameraState, isMicrophoneEnabled);
-            }
-        } else if (newCameraState) {
-            await setupMedia(selectedCameraId, selectedMicrophoneId, newCameraState, isMicrophoneEnabled);
-        }
-    };
-
-    const toggleMicrophone = async () => {
-        const newMicState = !isMicrophoneEnabled;
-        console.log('[CONTROLS] Toggling microphone:', newMicState ? 'ON' : 'OFF');
-        setIsMicrophoneEnabled(newMicState);
-
-        if (localStream.current) {
-            const audioTracks = localStream.current.getAudioTracks();
-
-            if (audioTracks.length > 0) {
-                audioTracks.forEach(track => {
-                    track.enabled = newMicState;
-                });
-
-                // Update track in peer connections
-                for (const [targetPrincipal, peerData] of peerConnections.current) {
-                    const senders = peerData.pc.getSenders();
-                    const audioSender = senders.find(sender => sender.track && sender.track.kind === 'audio');
-
-                    if (audioSender && audioSender.track) {
-                        audioSender.track.enabled = newMicState;
-                        console.log(`[CONTROLS] Updated audio track enabled state for ${targetPrincipal}: ${newMicState}`);
-                    }
-                }
-            } else if (newMicState) {
-                await setupMedia(selectedCameraId, selectedMicrophoneId, isCameraEnabled, newMicState);
-            }
-        } else if (newMicState) {
-            await setupMedia(selectedCameraId, selectedMicrophoneId, isCameraEnabled, newMicState);
-        }
-    };
-
-    // ========== DYNAMIC GRID CALCULATOR ==========
-    const getVideoGridLayout = (totalVideos: number) => {
-        if (totalVideos <= 0) return { cols: 1, rows: 1 };
-        if (totalVideos === 1) return { cols: 1, rows: 1 };
-        if (totalVideos === 2) return { cols: 2, rows: 1 };
-        if (totalVideos <= 4) return { cols: 2, rows: 2 };
-        if (totalVideos <= 6) return { cols: 3, rows: 2 };
-        if (totalVideos <= 9) return { cols: 3, rows: 3 };
-        if (totalVideos <= 12) return { cols: 4, rows: 3 };
-        return { cols: 4, rows: Math.ceil(totalVideos / 4) };
-    };
-
-    // ========== ENHANCED PEER CONNECTION ==========
-    const createPeerConnectionForUser = async (targetPrincipal: string): Promise<void> => {
-        try {
-            console.log(`[PEER] Creating peer connection for ${targetPrincipal}...`);
-
-            const pc = new RTCPeerConnection({
-                iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'stun:stun2.l.google.com:19302' }
-                ],
-                iceCandidatePoolSize: 10,
-                iceTransportPolicy: 'all'
-            });
-
-            // CREATE VIDEO ELEMENT BUT DON'T ADD TO DOM YET
-            const videoElement = document.createElement('video');
-            videoElement.autoplay = true;
-            videoElement.playsInline = true;
-            videoElement.muted = false;
-            videoElement.className = 'w-full h-full bg-gray-800 rounded-lg object-cover';
-            videoElement.style.aspectRatio = '16/9';
-
-            // ENHANCED TRACK HANDLING - DEBUGGING
-            pc.ontrack = (event) => {
-                console.log(`[REMOTE] - Track received from ${targetPrincipal}:`);
-                console.log(`[REMOTE] - Track kind: ${event.track.kind}`);
-                console.log(`[REMOTE] - Track enabled: ${event.track.enabled}`);
-                console.log(`[REMOTE] - Track readyState: ${event.track.readyState}`);
-                console.log(`[REMOTE] - Streams count: ${event.streams.length}`);
-
-                const [remoteStream] = event.streams;
-
-                if (remoteStream) {
-                    console.log(`[REMOTE] - Remote stream received from ${targetPrincipal}`);
-                    console.log(`[REMOTE] - Stream active: ${remoteStream.active}`);
-                    console.log(`[REMOTE] - Stream tracks: ${remoteStream.getTracks().length}`);
-
-                    // Log each track in the stream
-                    remoteStream.getTracks().forEach((track, index) => {
-                        console.log(`[REMOTE] - Track ${index}: ${track.kind}, enabled: ${track.enabled}, readyState: ${track.readyState}`);
-                    });
-
-                    // Set video source
-                    videoElement.srcObject = remoteStream;
-
-                    // Update peer data
-                    const peerData = peerConnections.current.get(targetPrincipal);
-                    if (peerData) {
-                        peerData.remoteStream = remoteStream;
-                    }
-
-                    // ENHANCED VIDEO PLAY WITH ERROR HANDLING
-                    videoElement.play()
-                        .then(() => {
-                            console.log(`[REMOTE] Video playing successfully for ${targetPrincipal}`);
-                        })
-                        .catch(err => {
-                            console.error(`[REMOTE] Video play failed for ${targetPrincipal}:`, err);
-
-                            // Retry playing after a short delay
-                            setTimeout(() => {
-                                videoElement.play().catch(retryErr => {
-                                    console.error(`[REMOTE] Video play retry failed for ${targetPrincipal}:`, retryErr);
-                                });
-                            }, 1000);
-                        });
-
-                    // ADD VIDEO EVENT LISTENERS FOR DEBUGGING
-                    videoElement.onloadedmetadata = () => {
-                        console.log(`[REMOTE] Video metadata loaded for ${targetPrincipal}`);
-                        console.log(`[REMOTE] - Video dimensions: ${videoElement.videoWidth}x${videoElement.videoHeight}`);
-                    };
-
-                    videoElement.oncanplay = () => {
-                        console.log(`[REMOTE]  Video can play for ${targetPrincipal}`);
-                    };
-
-                    videoElement.onerror = (error) => {
-                        console.error(`[REMOTE] Video error for ${targetPrincipal}:`, error);
-                    };
-
-                } else {
-                    console.warn(`[REMOTE] No remote stream in track event from ${targetPrincipal}`);
-                }
-
-                // Enhanced remote audio monitoring for AI translation
-                if (event.track.kind === 'audio' && showAITranslate) {
-                    try {
-                        const audioContext = new AudioContext();
-                        const source = audioContext.createMediaStreamSource(remoteStream);
-                        const analyser = audioContext.createAnalyser();
-
-                        analyser.fftSize = 256;
-                        source.connect(analyser);
-
-                        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-                        // Simple volume detection for remote speech
-                        const checkAudioLevel = () => {
-                            analyser.getByteFrequencyData(dataArray);
-                            const average = dataArray.reduce((sum, value) => sum + value) / dataArray.length;
-
-                            if (average > 30) { // Threshold for speech detection
-                                // For now, we'll just log detected speech activity
-                                // handleSpeechResult(
-                                //     '[Remote audio detected - speech-to-text not implemented]',
-                                //     targetPrincipal,
-                                //     `User ${targetPrincipal.substring(0, 8)}...`,
-                                //     false
-                                // );
-                            }
-
-                            if (showAITranslate) {
-                                requestAnimationFrame(checkAudioLevel);
-                            }
-                        };
-
-                        checkAudioLevel();
-
-                    } catch (error) {
-                        console.warn('[AI-TRANSLATE] Audio monitoring setup failed:', error);
-                    }
-                }
-            };
-
-            // ENHANCED CONNECTION STATE TRACKING - ONLY SHOW VIDEO WHEN CONNECTED
-            pc.onconnectionstatechange = () => {
-                console.log(`[PEER] Connection state for ${targetPrincipal}:`, pc.connectionState);
-
-                const peerData = peerConnections.current.get(targetPrincipal);
-                if (peerData) {
-                    peerData.connectionState = pc.connectionState;
-                }
-
-                switch (pc.connectionState) {
-                    case 'connected':
-                        console.log(`[PEER] Successfully connected to ${targetPrincipal}`);
-
-                        // ONLY ADD VIDEO ELEMENT TO DOM WHEN CONNECTED
-                        if (remoteVideosContainerRef.current && !document.getElementById(`video-wrapper-${targetPrincipal}`)) {
-                            const videoWrapper = document.createElement('div');
-                            videoWrapper.className = 'relative bg-gray-800/50 rounded-xl overflow-hidden border border-gray-600/50 hover:border-lime-400/50 transition-all w-full';
-                            videoWrapper.style.aspectRatio = '16/9';
-                            videoWrapper.id = `video-wrapper-${targetPrincipal}`;
-
-                            // Apply SpotlightCard effect (optional)
-                            videoWrapper.style.background = 'linear-gradient(145deg, rgba(55, 65, 81, 0.5), rgba(75, 85, 99, 0.5))';
-                            videoWrapper.style.boxShadow = '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)';
-
-                            // Set video element styling
-                            videoElement.className = 'w-full h-full object-cover';
-
-                            // CLEAN USER LABEL
-                            const label = document.createElement('div');
-                            label.className = 'absolute bottom-3 left-3 bg-black/70 text-white text-xs px-2 py-1 rounded backdrop-blur-sm border border-white/20';
-                            label.textContent = `${targetPrincipal.substring(0, 8)}...`;
-
-                            // CONNECTION STATUS INDICATOR
-                            const statusIndicator = document.createElement('div');
-                            statusIndicator.className = 'absolute top-3 right-3 w-3 h-3 bg-lime-400 rounded-full border-2 border-white animate-pulse';
-                            statusIndicator.id = `status-${targetPrincipal}`;
-
-                            // PARTICIPANT BADGE
-                            const participantBadge = document.createElement('div');
-                            participantBadge.className = 'absolute top-3 left-3 bg-lime-500/20 text-lime-300 border border-lime-500/30 text-xs px-2 py-1 rounded backdrop-blur-sm';
-                            participantBadge.innerHTML = '<div class="w-2 h-2 bg-lime-400 rounded-full mr-2 animate-pulse" style="display: inline-block;"></div>Connected';
-
-                            videoWrapper.appendChild(videoElement);
-                            videoWrapper.appendChild(label);
-                            videoWrapper.appendChild(statusIndicator);
-                            videoWrapper.appendChild(participantBadge);
-                            remoteVideosContainerRef.current.appendChild(videoWrapper);
-
-                            console.log(`[PEER] Video element added to DOM for ${targetPrincipal} with 16:9 aspect ratio`);
-                        }
-
-                        // VERIFY REMOTE STREAMS AFTER CONNECTION
-                        setTimeout(() => {
-                            const receivers = pc.getReceivers();
-                            console.log(`[PEER] Receivers for ${targetPrincipal}:`, receivers.length);
-
-                            receivers.forEach((receiver, index) => {
-                                if (receiver.track) {
-                                    console.log(`[PEER] - Receiver ${index}: ${receiver.track.kind}, enabled: ${receiver.track.enabled}`);
-                                }
-                            });
-
-                            const senders = pc.getSenders();
-                            console.log(`[PEER] Senders for ${targetPrincipal}:`, senders.length);
-
-                            senders.forEach((sender, index) => {
-                                if (sender.track) {
-                                    console.log(`[PEER] - Sender ${index}: ${sender.track.kind}, enabled: ${sender.track.enabled}`);
-                                }
-                            });
-                        }, 2000);
-
-                        setConnectedPeers(prev => {
-                            if (!prev.includes(targetPrincipal)) {
-                                return [...prev, targetPrincipal];
-                            }
-                            return prev;
-                        });
-                        break;
-
-                    case 'connecting':
-                        console.log(`[PEER] Connecting to ${targetPrincipal}...`);
-                        // Don't show video element yet, just log
-                        break;
-
-                    case 'disconnected':
-                    case 'failed':
-                        console.log(`[PEER] Connection ${pc.connectionState} for ${targetPrincipal}`);
-
-                        // REMOVE VIDEO ELEMENT FROM DOM WHEN DISCONNECTED/FAILED
-                        const existingWrapper = document.getElementById(`video-wrapper-${targetPrincipal}`);
-                        if (existingWrapper && existingWrapper.parentNode) {
-                            existingWrapper.parentNode.removeChild(existingWrapper);
-                            console.log(`[PEER] Video element removed from DOM for ${targetPrincipal}`);
-                        }
-
-                        setConnectedPeers(prev => prev.filter(p => p !== targetPrincipal));
-
-                        if (pc.connectionState === 'failed') {
-                            console.log(`[PEER] Connection failed for ${targetPrincipal}, will retry...`);
-                            setTimeout(() => {
-                                cleanupPeerConnection(targetPrincipal);
-                                handleNewParticipantConnection(targetPrincipal);
-                            }, 3000);
-                        }
-                        break;
-
-                    default:
-                        console.log(`[PEER] Connection state ${pc.connectionState} for ${targetPrincipal}`);
-                        // Don't show video element for other states
-                        break;
-                }
-            };
-
-            pc.onsignalingstatechange = () => {
-                console.log(`[PEER] Signaling state for ${targetPrincipal}:`, pc.signalingState);
-
-                const peerData = peerConnections.current.get(targetPrincipal);
-                if (peerData) {
-                    peerData.hasLocalDescription = !!pc.localDescription;
-                    peerData.hasRemoteDescription = !!pc.remoteDescription;
-                }
-            };
-
-            pc.oniceconnectionstatechange = () => {
-                console.log(`[PEER] ICE connection state for ${targetPrincipal}:`, pc.iceConnectionState);
-
-                if (pc.iceConnectionState === 'failed') {
-                    console.log(`[PEER] ICE failed for ${targetPrincipal}, restarting ICE...`);
-                    pc.restartIce();
-                }
-            };
-
-            // ICE candidate handling
-            pc.onicecandidate = async (event) => {
-                if (event.candidate) {
-                    try {
-                        await sendICECandidate(event.candidate, targetPrincipal);
-                    } catch (error) {
-                        console.error(`[PEER] Failed to send ICE candidate for ${targetPrincipal}:`, error);
-                    }
-                } else {
-                    console.log(`[PEER] ICE gathering completed for ${targetPrincipal}`);
-                }
-            };
-
-            // ENHANCED LOCAL TRACK ADDITION WITH VERIFICATION
-            if (localStream.current) {
-                console.log(`[PEER] Adding local tracks to ${targetPrincipal}...`);
-
-                localStream.current.getTracks().forEach((track, index) => {
-                    try {
-                        console.log(`[PEER] Adding track ${index} (${track.kind}) to ${targetPrincipal}`);
-                        console.log(`[PEER] - Track enabled: ${track.enabled}, readyState: ${track.readyState}`);
-
-                        const sender = pc.addTrack(track, localStream.current!);
-                        console.log(`[PEER] Added ${track.kind} track for ${targetPrincipal}`, sender);
-                    } catch (error) {
-                        console.error(`[PEER] Failed to add ${track.kind} track for ${targetPrincipal}:`, error);
-                    }
-                });
-
-                // VERIFY TRACKS WERE ADDED
-                setTimeout(() => {
-                    const senders = pc.getSenders();
-                    console.log(`[PEER] Verification - Total senders for ${targetPrincipal}:`, senders.length);
-
-                    senders.forEach((sender, index) => {
-                        if (sender.track) {
-                            console.log(`[PEER] - Sender ${index}: ${sender.track.kind}`);
-                        } else {
-                            console.warn(`[PEER] - Sender ${index}: NO TRACK!`);
-                        }
-                    });
-                }, 1000);
-            } else {
-                console.warn(`[PEER] No local stream available when creating peer connection for ${targetPrincipal}`);
-            }
-
-            // Store peer connection data
-            peerConnections.current.set(targetPrincipal, {
-                pc,
-                remoteStream: null,
-                videoElement, // Store video element but it's not in DOM yet
-                connectionState: pc.connectionState,
-                hasLocalDescription: false,
-                hasRemoteDescription: false,
-                isOfferer: false,
-                isAnswerer: false
-            });
-
-            console.log(`[PEER] Peer connection created for ${targetPrincipal}`);
-
-        } catch (err) {
-            console.error(`[PEER] Error creating peer connection for ${targetPrincipal}:`, err);
-        }
-    };
-
-    // ========== SIGNAL POLLING ==========
-    const startAutomaticSignalPolling = () => {
-        if (isSignalPolling || !roomId || !principalId) return;
-
-        console.log('[POLLING] Starting automatic signal polling...');
-        setIsSignalPolling(true);
-
-        signalIntervalRef.current = setInterval(async () => {
-            try {
-                await processIncomingSignals();
-            } catch (error) {
-                console.error('[POLLING] Error:', error);
-            }
-        }, 2000);
-    };
-
-    const processIncomingSignals = async () => {
-        if (!roomId || !principalId) return;
-
-        try {
-            const signals = await getSignals(roomId, Principal.fromText(principalId));
-            if (signals.length === 0) return;
-
-            console.log(`[AUTO-SIGNAL] Found ${signals.length} incoming signals`);
-
-            // Process signals by type priority: offers first, then answers, then ICE
-            const offers = signals.filter(s => s.kind === 'offer');
-            const answers = signals.filter(s => s.kind === 'answer');
-            const ices = signals.filter(s => s.kind === 'ice');
-
-            // Process offers first
-            for (const signal of offers) {
-                const signalId = `${signal.from.toText()}-${signal.kind}-${Date.now()}`;
-                if (!processedSignals.current.has(signalId)) {
-                    processedSignals.current.add(signalId);
-                    await autoProcessOffer(signal);
-                    await new Promise(resolve => setTimeout(resolve, 200));
-                }
-            }
-
-            // Process answers second
-            for (const signal of answers) {
-                const signalId = `${signal.from.toText()}-${signal.kind}-${Date.now()}`;
-                if (!processedSignals.current.has(signalId)) {
-                    processedSignals.current.add(signalId);
-                    await autoProcessAnswer(signal);
-                    await new Promise(resolve => setTimeout(resolve, 200));
-                }
-            }
-
-            // Process ICE candidates last
-            for (const signal of ices) {
-                await autoProcessICE(signal);
-                await new Promise(resolve => setTimeout(resolve, 50));
-            }
-
-            // Clear signals after processing all
-            if (signals.length > 0) {
-                setTimeout(async () => {
-                    try {
-                        await clearSignals(roomId);
-                        console.log('[AUTO-SIGNAL] Cleared processed signals');
-                    } catch (error) {
-                        console.error('[AUTO-SIGNAL] Error clearing signals:', error);
-                    }
-                }, 500);
-            }
-
-        } catch (error) {
-            console.error('[AUTO-SIGNAL] Error processing signals:', error);
-        }
-    };
-
-    const stopSignalPolling = () => {
-        console.log('Stopping signal polling');
-        setIsSignalPolling(false);
-        if (signalIntervalRef.current) {
-            clearInterval(signalIntervalRef.current);
-            signalIntervalRef.current = null;
-        }
-    };
-
-    // ========== ENHANCED SIGNAL PROCESSING ==========
-    const autoProcessOffer = async (offerSignal: Signal) => {
-        const fromPrincipal = offerSignal.from.toText();
-
-        try {
-            console.log(`[AUTO-OFFER] Processing offer from ${fromPrincipal}`);
-
-            // Create peer connection if doesn't exist
-            if (!peerConnections.current.has(fromPrincipal)) {
-                await createPeerConnectionForUser(fromPrincipal);
-            }
-
-            const peerData = peerConnections.current.get(fromPrincipal);
-            if (!peerData || !roomId) return;
-
-            // ENHANCED RENEGOTIATION HANDLING
-            if (peerData.pc.signalingState === 'stable' && peerData.hasRemoteDescription) {
-                console.log(`[AUTO-OFFER] Handling renegotiation offer from ${fromPrincipal}`);
-
-                // This is a renegotiation offer
-                const remoteDesc = new RTCSessionDescription(JSON.parse(offerSignal.data));
-                await peerData.pc.setRemoteDescription(remoteDesc);
-
-                // Create and send answer for renegotiation
-                const answer = await peerData.pc.createAnswer();
-                await peerData.pc.setLocalDescription(answer);
-
-                const answerSignal: Signal = {
-                    from: Principal.fromText(principalId),
-                    to: offerSignal.from,
-                    kind: 'answer',
-                    data: JSON.stringify(answer)
+            stream.getAudioTracks().forEach(t => {
+                t.onended = () => {
+                    micOnRef.current = false; setMicOn(false);
+                    refreshCallsAfterMicChange();
                 };
+            });
+            localStreamRef.current = stream;
+            attachLocalAnalyser(stream);
+            return stream;
+        } catch {
+            return null;
+        }
+    };
 
-                await sendSignal(roomId, answerSignal);
-                console.log(`[AUTO-OFFER] Sent renegotiation answer to ${fromPrincipal}`);
+    const closeMic = () => {
+        try { localStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch { }
+        localStreamRef.current = null;
+        detachLocalAnalyser();
+    };
 
-                return;
+    /** Try playing every remote audio (for autoplay unlock) */
+    const tryPlayAllRemote = () => {
+        for (const el of Object.values(remoteAudiosRef.current)) {
+            try { el?.play?.().catch(() => { }); } catch { }
+        }
+    };
+
+    /** call this after any mic state change (on/off/apply device) */
+    const refreshCallsAfterMicChange = () => {
+        for (const [, c] of connsRef.current) {
+            if (c.open) { try { c.send({ t: "media-refresh", why: micOnRef.current ? "mic-on" : "mic-off" } as Msg); } catch { } }
+        }
+        for (const rid of mediaConnsRef.current.keys()) {
+            try { mediaConnsRef.current.get(rid)?.close(); } catch { }
+            mediaConnsRef.current.delete(rid);
+        }
+        const out = getOutboundStream();
+        if (!out) return;
+        setTimeout(() => {
+            for (const rid of connsRef.current.keys()) startMediaCall(rid);
+        }, 120);
+    };
+
+    /** Replace sender track on existing RTCPeerConnections without full reneg */
+    const swapOutboundTrackForAll = (stream: MediaStream | null) => {
+        const track = stream?.getAudioTracks?.()[0] || null;
+        for (const [, call] of mediaConnsRef.current) {
+            const pc: RTCPeerConnection | undefined = (call as any)?.peerConnection;
+            const sender = pc?.getSenders().find(s => s.track && s.track.kind === "audio");
+            if (sender) {
+                sender.replaceTrack(track).catch(() => { });
             }
+        }
+    };
 
-            // Handle offer collision by principal comparison
-            if (peerData.pc.signalingState === 'have-local-offer') {
-                console.log(`[AUTO-OFFER] Offer collision detected with ${fromPrincipal}`);
+    /** Toggle Mic main button */
+    const onToggleMic = async () => {
+        await ensureAudioCtx()?.resume().catch(() => { });
+        if (!micOnRef.current) {
+            const stream = await acquireMic(selectedMicId || undefined);
+            if (!stream) return;
+            micOnRef.current = true;
+            setMicOn(true);
+            swapOutboundTrackForAll(stream);
+            for (const [, c] of connsRef.current) c.open && c.send({ t: "media-refresh", why: "mic-on" } as Msg);
+        } else {
+            micOnRef.current = false;
+            setMicOn(false);
+            const silent = ensureSilentOut();
+            swapOutboundTrackForAll(silent);
+            closeMic();
+            for (const [, c] of connsRef.current) c.open && c.send({ t: "media-refresh", why: "mic-off" } as Msg);
+        }
+    };
 
-                if (principalId < fromPrincipal) {
-                    console.log(`[AUTO-OFFER] Ignoring offer from ${fromPrincipal} (I have smaller principal)`);
-                    return;
-                } else {
-                    console.log(`[AUTO-OFFER] Rolling back my offer for ${fromPrincipal} (they have smaller principal)`);
-                    try {
-                        await peerData.pc.setLocalDescription(undefined);
-                        peerData.hasLocalDescription = false;
-                    } catch (rollbackError) {
-                        console.error(`[AUTO-OFFER] Rollback failed:`, rollbackError);
-                        cleanupPeerConnection(fromPrincipal);
-                        await createPeerConnectionForUser(fromPrincipal);
-                        const newPeerData = peerConnections.current.get(fromPrincipal);
-                        if (newPeerData) {
-                            peerData.pc = newPeerData.pc;
-                        }
+    /** Apply device in settings */
+    const onApplyMic = async () => {
+        await ensureAudioCtx()?.resume().catch(() => { });
+        closeMic();
+        const stream = await acquireMic(selectedMicId || undefined);
+        if (!stream) return;
+        micOnRef.current = true;
+        setMicOn(true);
+        refreshCallsAfterMicChange();
+    };
+
+
+    /** Auto-update VAD & mouth blink */
+    useEffect(() => {
+        let timer = window.setInterval(() => {
+            const now = performance.now();
+
+            // local
+            const lvlSelf = computeLevel(localAnalyserRef.current);
+            if (lvlSelf > SPK_THRESHOLD) lastLoudAtSelfRef.current = now;
+            speakingRef.current[myPeerId] = (now - lastLoudAtSelfRef.current) < VAD_HOLD_MS;
+
+            // remotes
+            Object.keys(remoteAnalyserRef.current).forEach(pid => {
+                const an = remoteAnalyserRef.current[pid];
+                const lvl = computeLevel(an || null);
+                if (lvl > SPK_THRESHOLD) lastLoudAtRef.current[pid] = now;
+                const speakingNow = (now - (lastLoudAtRef.current[pid] || 0)) < VAD_HOLD_MS;
+                speakingRef.current[pid] = speakingNow;
+
+                if (speakingNow) {
+                    if (!lastBlinkAtRef.current[pid] || now - lastBlinkAtRef.current[pid] >= BLINK_MS) {
+                        talkBlinkRef.current[pid] = !talkBlinkRef.current[pid];
+                        lastBlinkAtRef.current[pid] = now;
                     }
+                } else {
+                    talkBlinkRef.current[pid] = false;
                 }
-            }
+            });
+        }, 150);
+        return () => window.clearInterval(timer);
+    }, [myPeerId]);
 
-            // Set remote description (initial offer)
-            const remoteDesc = new RTCSessionDescription(JSON.parse(offerSignal.data));
-            await peerData.pc.setRemoteDescription(remoteDesc);
-            peerData.hasRemoteDescription = true;
-            peerData.isAnswerer = true;
 
-            // Create and set answer
-            const answer = await peerData.pc.createAnswer();
-            await peerData.pc.setLocalDescription(answer);
-            peerData.hasLocalDescription = true;
+    /** Start/answer media calls */
+    const startMediaCall = (remotePeerId: string) => {
+        const peer = peerRef.current; if (!peer) return;
+        if (mediaConnsRef.current.has(remotePeerId)) return;
 
-            // Send answer
-            const answerSignal: Signal = {
-                from: Principal.fromText(principalId),
-                to: offerSignal.from,
-                kind: 'answer',
-                data: JSON.stringify(answer)
-            };
+        const out = getOutboundStream();
+        if (!out) return;
 
-            await sendSignal(roomId, answerSignal);
-            console.log(`[AUTO-OFFER] Sent answer to ${fromPrincipal}`);
-
-            // Process pending ICE candidates
-            setTimeout(() => {
-                processPendingICECandidates(fromPrincipal);
-            }, 300);
-
-        } catch (error) {
-            console.error(`[AUTO-OFFER] Error processing offer from ${fromPrincipal}:`, error);
-
-            setTimeout(() => {
-                cleanupPeerConnection(fromPrincipal);
-                handleNewParticipantConnection(fromPrincipal);
-            }, 2000);
-        }
+        let call: MediaConnection | undefined;
+        try {
+            call = peer.call(remotePeerId, out, { metadata: { kind: "proximity-audio" } });
+        } catch { return; }
+        if (!call) return;
+        hookMediaConn(remotePeerId, call);
     };
 
-    const autoProcessAnswer = async (answerSignal: Signal) => {
-        const fromPrincipal = answerSignal.from.toText();
-
+    const answerMediaCall = (remotePeerId: string, call: MediaConnection) => {
+        const out = getOutboundStream();
         try {
-            console.log(`[AUTO-ANSWER] Processing answer from ${fromPrincipal}`);
-
-            const peerData = peerConnections.current.get(fromPrincipal);
-            if (!peerData) {
-                console.log(`[AUTO-ANSWER] No peer connection found for ${fromPrincipal}`);
-                return;
-            }
-
-            if (peerData.pc.signalingState !== 'have-local-offer') {
-                console.log(`[AUTO-ANSWER] Peer not ready for answer, state: ${peerData.pc.signalingState}`);
-                return;
-            }
-
-            const remoteDesc = new RTCSessionDescription(JSON.parse(answerSignal.data));
-            await peerData.pc.setRemoteDescription(remoteDesc);
-            peerData.hasRemoteDescription = true;
-
-            console.log(`[AUTO-ANSWER] Processed answer from ${fromPrincipal}`);
-
-            // Process pending ICE candidates
-            setTimeout(() => {
-                processPendingICECandidates(fromPrincipal);
-            }, 300);
-
-        } catch (error) {
-            console.error(`[AUTO-ANSWER] Error processing answer from ${fromPrincipal}:`, error);
+            if (out) call.answer(out); else call.answer();
+        } catch (e) {
+            log(`answer error ${pretty(remotePeerId)}: ${String((e as any)?.message || e)}`);
         }
+        hookMediaConn(remotePeerId, call);
     };
 
-    const autoProcessICE = async (iceSignal: Signal) => {
-        const fromPrincipal = iceSignal.from.toText();
+    /** Watch native PC states (retry on fail) */
+    const watchPeerConn = (remotePeerId: string, call: MediaConnection) => {
+        const pc: RTCPeerConnection | undefined = (call as any)?.peerConnection;
+        if (!pc) return;
+        const bump = (why: string) => {
+            log(`PC(${pretty(remotePeerId)}) ${why}, retry...`);
+            try { call.close(); } catch { }
+            mediaConnsRef.current.delete(remotePeerId);
+            setTimeout(() => startMediaCall(remotePeerId), 250);
+        };
+        pc.onconnectionstatechange = () => {
+            const st = pc.connectionState;
+            if (st === "failed" || st === "disconnected") bump(`state=${st}`);
+        };
+        pc.oniceconnectionstatechange = () => {
+            const st = pc.iceConnectionState;
+            if (st === "failed" || st === "disconnected") bump(`ice=${st}`);
+        };
+    };
 
-        try {
-            const peerData = peerConnections.current.get(fromPrincipal);
+    /** Volume attenuation by zone & distance */
+    const calcAudibility = (meTx: number, meTy: number, pTx: number, pTy: number) => {
+        const myRule = audioRuleAt(meTx, meTy);
+        const hisRule = audioRuleAt(pTx, pTy);
 
-            // Store ICE candidate if no peer connection
-            if (!peerData) {
-                const pending = pendingICECandidates.current.get(fromPrincipal) || [];
-                pending.push(new RTCIceCandidate(JSON.parse(iceSignal.data)));
-                pendingICECandidates.current.set(fromPrincipal, pending);
-                console.log(`[AUTO-ICE] Stored ICE candidate from ${fromPrincipal} (no peer connection)`);
-                return;
+        if (myRule.kind === "room") {
+            const same = hisRule.kind === "room" && hisRule.zoneId === myRule.zoneId;
+            return { audible: same, vol: same ? 1 : 0 };
+        }
+
+        if (hisRule.kind === "room") return { audible: false, vol: 0 };
+
+        const R = myRule.kind === "radius" ? myRule.radius : DEFAULT_AUDIO_RADIUS_TILES;
+        const d = Math.max(Math.abs(pTx - meTx), Math.abs(pTy - meTy));
+        if (d > R) return { audible: false, vol: 0 };
+
+        const t = Math.min(1, d / Math.max(1, R));
+        const vol = clamp(1 - t * t * 0.85, 0.18, 1);
+        return { audible: true, vol };
+    };
+
+    /** Attach/maintain MediaConnection */
+    const hookMediaConn = (remotePeerId: string, call: MediaConnection) => {
+        const old = mediaConnsRef.current.get(remotePeerId);
+        if (old && old !== call) {
+            try { old.close(); } catch { }
+            mediaConnsRef.current.delete(remotePeerId);
+        }
+        mediaConnsRef.current.set(remotePeerId, call);
+        watchPeerConn(remotePeerId, call);
+
+        call.on("stream", (remoteStream) => {
+            let el = remoteAudiosRef.current[remotePeerId];
+            if (!el) {
+                el = document.createElement("audio");
+                el.autoplay = true;
+                (el as any).playsInline = true;
+                el.muted = true;
+                el.volume = 1;
+                document.body.appendChild(el);
+                remoteAudiosRef.current[remotePeerId] = el;
             }
 
-            // Validate ICE candidate data
-            const candidateData = JSON.parse(iceSignal.data);
-            if (!candidateData || (!candidateData.candidate && candidateData.candidate !== '')) {
-                console.log(`[AUTO-ICE] Skipping end-of-candidates from ${fromPrincipal}`);
-                return;
-            }
+            el.srcObject = remoteStream;
+            attachRemoteAnalyser(remotePeerId, remoteStream);
+            el.play?.().catch(() => { });
 
-            // Check if peer is ready for ICE candidates
-            const canAddICE = (
-                peerData.pc.remoteDescription !== null &&
-                peerData.pc.connectionState !== 'closed' &&
-                peerData.pc.connectionState !== 'failed'
-            );
-
-            if (!canAddICE) {
-                // Store for later
-                const pending = pendingICECandidates.current.get(fromPrincipal) || [];
-                pending.push(new RTCIceCandidate(candidateData));
-                pendingICECandidates.current.set(fromPrincipal, pending);
-                console.log(`[AUTO-ICE] Stored ICE candidate from ${fromPrincipal} (peer not ready)`);
-                return;
-            }
-
-            // Add ICE candidate
-            const candidate = new RTCIceCandidate(candidateData);
-            await peerData.pc.addIceCandidate(candidate);
-            console.log(`[AUTO-ICE] Added ICE candidate from ${fromPrincipal}`);
-
-        } catch (error) {
-            console.error(`[AUTO-ICE] Error processing ICE from ${fromPrincipal}:`, error);
-
-            // Store failed candidate for retry
             try {
-                const candidateData = JSON.parse(iceSignal.data);
-                const pending = pendingICECandidates.current.get(fromPrincipal) || [];
-                pending.push(new RTCIceCandidate(candidateData));
-                pendingICECandidates.current.set(fromPrincipal, pending);
-                console.log(`[AUTO-ICE] Stored failed ICE candidate for retry: ${fromPrincipal}`);
-            } catch (storeError) {
-                console.error(`[AUTO-ICE] Failed to store ICE candidate:`, storeError);
+                const me = meRef.current;
+                const { col: meTx, row: meTy } = centerTileOf(me.x, me.y);
+                const p = othersRef.current[remotePeerId];
+                if (p) {
+                    const { col: pTx, row: pTy } = centerTileOf(p.x, p.y);
+                    const { audible, vol } = calcAudibility(meTx, meTy, pTx, pTy);
+                    const forceMute = !!remoteUserMutedRef.current[remotePeerId];
+                    el.muted = !(audible && !forceMute);
+                    el.volume = audible ? vol : 0;
+                }
+            } catch { }
+
+            tryPlayAllRemote();
+        });
+
+        call.on("close", () => {
+            mediaConnsRef.current.delete(remotePeerId);
+
+            const el = remoteAudiosRef.current[remotePeerId];
+            try { el?.pause(); if (el) (el as any).srcObject = null; el?.remove(); } catch { }
+            remoteAudiosRef.current[remotePeerId] = null;
+
+            try { remoteSourceRef.current[remotePeerId]?.disconnect(); } catch { }
+            remoteSourceRef.current[remotePeerId] = null;
+            remoteAnalyserRef.current[remotePeerId] = null;
+            remoteLevelRef.current[remotePeerId] = 0;
+
+            setTimeout(() => {
+                if (!mediaConnsRef.current.has(remotePeerId)) startMediaCall(remotePeerId);
+            }, 220);
+        });
+
+        call.on("error", (e) => {
+            log(`audio error ${pretty(remotePeerId)}: ${String((e as any)?.message || e)}`);
+        });
+    };
+
+    /** Small helper so our keyboard/mouse gesture also unlocks audio */
+    const isEditableTarget = (e: KeyboardEvent) => {
+        const t = (e.target as HTMLElement) || null;
+        if (!t) return false;
+        if (t.isContentEditable) return true;
+        const tag = (t.tagName || "").toLowerCase();
+        return tag === "input" || tag === "textarea" || tag === "select";
+    };
+
+    /** Live mic level meter (only while panel open) */
+    const [micLevel, setMicLevel] = useState(0);
+    useEffect(() => {
+        let raf = 0;
+        const loop = () => {
+            if (showMicSettings) {
+                setMicLevel(computeLevel(localAnalyserRef.current));
+                raf = requestAnimationFrame(loop);
+            }
+        };
+        if (showMicSettings) raf = requestAnimationFrame(loop);
+        return () => cancelAnimationFrame(raf);
+    }, [showMicSettings]);
+
+
+    /** ===== Proximity gating + attenuation (called every frame) ===== */
+    const updateAudioZones = () => {
+        const me = meRef.current;
+        const { col: meTx, row: meTy } = centerTileOf(me.x, me.y);
+
+        for (const rid of Object.keys(remoteAudiosRef.current)) {
+            const el = remoteAudiosRef.current[rid];
+            if (!el) continue;
+
+            const p = othersRef.current[rid];
+            const forceMute = !!remoteUserMutedRef.current[rid];
+
+            if (!p) { el.muted = true; continue; }
+
+            const { col: pTx, row: pTy } = centerTileOf(p.x, p.y);
+            const { audible, vol } = calcAudibility(meTx, meTy, pTx, pTy);
+
+            const shouldPlay = audible && !forceMute;
+            if (shouldPlay) {
+                if (el.muted) {
+                    el.muted = false;
+                    el.play?.().catch(() => { });
+                }
+                el.volume = vol;
+            } else {
+                if (!el.muted) el.muted = true;
+                el.volume = 0;
             }
         }
     };
 
-    // ========== ICE CANDIDATE HELPERS ==========
-    const processPendingICECandidates = async (targetPrincipal: string) => {
-        const pending = pendingICECandidates.current.get(targetPrincipal) || [];
-        if (pending.length === 0) return;
+    /** Public util */
+    const setPeerMuted = (peerId: string, muted: boolean) => {
+        remoteUserMutedRef.current[peerId] = muted;
+        const el = remoteAudiosRef.current[peerId];
+        if (el) el.muted = muted || el.muted;
+    };
 
-        const peerData = peerConnections.current.get(targetPrincipal);
-        if (!peerData || !peerData.pc.remoteDescription) {
-            console.log(`[ICE] Cannot process pending ICE for ${targetPrincipal} - no remote description`);
+    /** UX: make sure first interaction resumes AudioContext + tries to play audio */
+    useEffect(() => {
+        const unlock = async () => {
+            try { await ensureAudioCtx().resume(); } catch { }
+            tryPlayAllRemote();
+        };
+        const onPointer = () => unlock();
+        const onKey = (e: KeyboardEvent) => { if (!isEditableTarget(e)) unlock(); };
+        window.addEventListener("pointerdown", onPointer, { passive: true, capture: true });
+        window.addEventListener("keydown", onKey, true);
+        return () => {
+            window.removeEventListener("pointerdown", onPointer, true as any);
+            window.removeEventListener("keydown", onKey, true);
+        };
+    }, []);
+
+    const chatPanelRef = useRef<HTMLDivElement | null>(null);
+    const rightSidebarRef = useRef<HTMLDivElement | null>(null);
+    const micPanelRef = useRef<HTMLDivElement | null>(null);
+
+    useEffect(() => {
+        const onPointerDown = (e: PointerEvent) => {
+            if (!(showChat || showSidebar || showMicSettings)) return;
+            if (showOutfit) return;
+
+            const target = e.target as HTMLElement | null;
+            if (!target) return;
+            if (target.closest("[data-no-dismiss]")) return;
+
+            const inside = (ref: React.RefObject<HTMLElement>) =>
+                !!ref.current && ref.current.contains(target);
+
+            if (showMicSettings) {
+                if (!inside(micPanelRef)) setShowMicSettings(false);
+                return;
+            }
+
+            if (showChat || showSidebar) {
+                const inChat = inside(chatPanelRef);
+                const inSidebar = inside(rightSidebarRef);
+
+                if (!inChat && !inSidebar) {
+                    if (showChat) setShowChat(false);
+                    if (showSidebar) setShowSidebar(false);
+                }
+
+                return;
+            }
+        };
+
+        window.addEventListener("pointerdown", onPointerDown, true);
+        return () => window.removeEventListener("pointerdown", onPointerDown, true);
+    }, [showChat, showSidebar, showMicSettings, showOutfit]);
+
+    /** ===== WORLD load ===== */
+    useEffect(() => {
+        let mounted = true;
+        (async () => {
+            try {
+                const world = await loadWorldMap();
+                if (mounted) {
+                    worldRef.current = world;
+                    scanDoors();
+                    markDone("world");
+                }
+            } catch { worldRef.current = null; }
+        })();
+        return () => { mounted = false; };
+    }, []);
+
+    /** ===== Player assets load ===== */
+    useEffect(() => {
+        let alive = true;
+        (async () => {
+            try {
+                const parts = await loadSpriteParts();
+                if (alive) { partsRef.current = parts; markDone("sprites"); }
+                recomputeAllOutfits();
+            } catch { }
+        })();
+        return () => { alive = false; };
+    }, []);
+
+    useEffect(() => {
+        let alive = true;
+        (async () => {
+            try {
+                const lib = await loadOutfitParts();
+                if (!alive) return;
+                outfitLibRef.current = lib;
+                recomputeAllOutfits();
+                if (!playerOutfitSlotsRef.current[myPeerId]) {
+                    setOutfitSlotsFor(myPeerId, DEFAULT_OUTFIT);
+                }
+                markDone("outfit");
+            } catch { }
+        })();
+        return () => { alive = false; };
+    }, [myPeerId]);
+
+    const recomputeOutfitFor = (pid: string) => {
+        const lib = outfitLibRef.current || null;
+        const slots = playerOutfitSlotsRef.current[pid] || DEFAULT_OUTFIT;
+        playerOutfitPartsRef.current[pid] = buildActiveOutfit(lib, slots);
+        outfitVersion.current++;
+    };
+    const setOutfitSlotsFor = (pid: string, slots: string[] | null | undefined) => {
+        playerOutfitSlotsRef.current[pid] = normalizeSlots(slots);
+        recomputeOutfitFor(pid);
+    };
+
+    /** ===== DOOR state ===== */
+    const doorSetRef = useRef<Set<string>>(new Set());
+
+    const scanDoors = () => {
+        const s = new Set<string>();
+        for (let r = 0; r < MAP_ROWS; r++) {
+            for (let c = 0; c < MAP_COLS; c++) {
+                if (isDoorId((wallLayout[r][c] | 0))) s.add(doorKey(c, r));
+            }
+        }
+        doorSetRef.current = s;
+    };
+
+    const isDoorOpen = (c: number, r: number) => (wallLayout[r]?.[c] === DOOR_OPEN_ID);
+
+    const rebuildWorld = async () => {
+        try {
+            const world = await loadWorldMap();
+            worldRef.current = world;
+        } catch { }
+    };
+
+    const canHearDoorAt = (doorCol: number, doorRow: number) => {
+        const { col: myCol, row: myRow } = centerTileOf(meRef.current.x, meRef.current.y);
+        const dCheb = Math.max(Math.abs(myCol - doorCol), Math.abs(myRow - doorRow));
+        return dCheb <= DOOR_SFX_RADIUS_TILES;
+    };
+
+    // SFX open/close
+    const sfxDoorOpenRef = useRef<HTMLAudioElement | null>(null);
+    const sfxDoorCloseRef = useRef<HTMLAudioElement | null>(null);
+    useEffect(() => {
+        sfxDoorOpenRef.current = new Audio("/assets/audio/DOOR_OPEN.mp3");
+        sfxDoorCloseRef.current = new Audio("/assets/audio/DOOR_CLOSE.mp3");
+        [sfxDoorOpenRef.current, sfxDoorCloseRef.current].forEach(a => {
+            if (!a) return;
+            a.preload = "auto";
+            a.volume = 0.7;
+            (a as any).playsInline = true;
+        });
+    }, []);
+    const playDoorSfx = (open: boolean) => {
+        const base = open ? sfxDoorOpenRef.current : sfxDoorCloseRef.current;
+        if (!base) return;
+        try {
+            const el = base.cloneNode(true) as HTMLAudioElement;
+            el.volume = base.volume;
+            el.play().catch(() => { });
+        } catch { }
+    };
+
+    const setDoor = async (c: number, r: number, open: boolean, opts?: { silent?: boolean }) => {
+        if (r < 0 || r >= MAP_ROWS || c < 0 || c >= MAP_COLS) return false;
+
+        const prev = wallLayout[r][c] | 0;
+        const next = open ? DOOR_OPEN_ID : DOOR_CLOSED_ID;
+        const changed = prev !== next;
+
+        wallLayout[r][c] = next;
+        const tr = r - 1;
+        if (tr >= 0) {
+            topLayout[tr][c] = open ? TOP_DOOR_OPEN_ID : TOP_DOOR_CLOSED_ID;
+        }
+
+        doorSetRef.current.add(doorKey(c, r));
+
+        if (changed && !opts?.silent && canHearDoorAt(c, r)) {
+            playDoorSfx(open);
+        }
+
+        await rebuildWorld();
+        return changed;
+    };
+
+    const findAdjacentDoor = (tc: number, tr: number): { col: number; row: number; open: boolean } | null => {
+        const dirs = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+        for (const [dx, dy] of dirs) {
+            const c = tc + dx, r = tr + dy;
+            if (r < 0 || r >= MAP_ROWS || c < 0 || c >= MAP_COLS) continue;
+            const id = wallLayout[r][c] | 0;
+            if (isDoorId(id)) return { col: c, row: r, open: id === DOOR_OPEN_ID };
+        }
+        return null;
+    };
+
+    const broadcastDoor = (col: number, row: number, open: boolean) => {
+        const wire: Msg = { t: "door", col, row, open };
+        for (const [, c] of connsRef.current) if (c.open) { try { c.send(wire); } catch { } }
+    };
+    const sendDoorSnapshotTo = (peerId: string) => {
+        const conn = connsRef.current.get(peerId);
+        if (!conn || !conn.open) return;
+        for (const key of doorSetRef.current) {
+            const [cStr, rStr] = key.split(",");
+            const c = Number(cStr), r = Number(rStr);
+            const open = isDoorOpen(c, r);
+            const msg: Msg = { t: "door", col: c, row: r, open, silent: true };
+            try { conn.send(msg); } catch { }
+        }
+    };
+
+    /** ===== LOADING overlay progress ===== */
+    type StageKey = "join" | "world" | "sprites" | "outfit" | "peerOpen" | "peers";
+
+    const STAGE_WEIGHTS: Record<StageKey, number> = {
+        join: 10,
+        world: 20,
+        sprites: 12,
+        outfit: 13,
+        peerOpen: 20,
+        peers: 25,
+    };
+
+    const [showLoader, setShowLoader] = useState<boolean>(true);
+    const [showPixelReveal, setShowPixelReveal] = useState<boolean>(false);
+    const [subtext, setSubtext] = useState<string>("Loading...");
+    const [percentText, setPercentText] = useState<number>(0);
+    const [uiPct, setUiPct] = useState(0);
+    const loaderVisibleRef = useRef(false);
+    const widthPct = `${uiPct}%`;
+
+    useEffect(() => {
+        if (showLoader) {
+            if (!loaderVisibleRef.current) {
+                loaderVisibleRef.current = true;
+                setUiPct(0);
+            }
+        } else {
+            loaderVisibleRef.current = false;
+            setUiPct(0);
+        }
+    }, [showLoader]);
+
+    useEffect(() => {
+        setUiPct(prev => (percentText > prev ? percentText : prev));
+    }, [percentText]);
+
+    const expectedPeersRef = useRef<Set<string>>(new Set());
+    const connectedPeersRef = useRef<Set<string>>(new Set());
+    const loaderDoneRef = useRef<boolean>(false);
+    const maxExpectedPeersRef = useRef<number>(1);
+    const peersPctRef = useRef<number>(0);
+    const progressGenRef = useRef<number>(0);
+
+    const startProgressSession = React.useCallback(() => {
+        progressGenRef.current++;
+        targetPctRef.current = 0;
+        peersPctRef.current = 0;
+        maxExpectedPeersRef.current = Math.max(1, expectedPeersRef.current.size || 1);
+        setPercentText(0);
+    }, []);
+
+    const stageDoneRef = useRef<Record<Exclude<StageKey, "peers">, boolean>>({
+        join: false,
+        world: false,
+        sprites: false,
+        outfit: false,
+        peerOpen: false,
+    });
+
+    const targetPctRef = useRef<number>(0);
+    const setStatus = (msg: string) => setSubtext(msg);
+
+    const recomputeProgress = () => {
+        let pctBase = 0;
+        pctBase += stageDoneRef.current.join ? STAGE_WEIGHTS.join : 0;
+        pctBase += stageDoneRef.current.world ? STAGE_WEIGHTS.world : 0;
+        pctBase += stageDoneRef.current.sprites ? STAGE_WEIGHTS.sprites : 0;
+        pctBase += stageDoneRef.current.outfit ? STAGE_WEIGHTS.outfit : 0;
+        pctBase += stageDoneRef.current.peerOpen ? STAGE_WEIGHTS.peerOpen : 0;
+
+        const totalPeersExpected = Math.max(1, expectedPeersRef.current.size);
+        maxExpectedPeersRef.current = Math.max(maxExpectedPeersRef.current, totalPeersExpected);
+        const currPeers = Math.min(connectedPeersRef.current.size, totalPeersExpected);
+
+        const peersRaw = (currPeers / Math.max(1, maxExpectedPeersRef.current)) * STAGE_WEIGHTS.peers;
+        peersPctRef.current = Math.max(peersPctRef.current, peersRaw);
+
+        const pct = pctBase + peersPctRef.current;
+
+        const allDone =
+            stageDoneRef.current.join &&
+            stageDoneRef.current.world &&
+            stageDoneRef.current.sprites &&
+            stageDoneRef.current.outfit &&
+            stageDoneRef.current.peerOpen &&
+            currPeers >= totalPeersExpected;
+
+        const newTarget = allDone ? 100 : Math.min(99, Math.floor(pct));
+        targetPctRef.current = Math.max(targetPctRef.current, newTarget);
+
+        if (!stageDoneRef.current.join) setStatus("Checking access...");
+        else if (!stageDoneRef.current.world) setStatus("Building the world...");
+        else if (!stageDoneRef.current.sprites || !stageDoneRef.current.outfit) setStatus("Customizing your avatar...");
+        else if (!stageDoneRef.current.peerOpen) setStatus("Booting voice & chat...");
+        else if (currPeers < totalPeersExpected) setStatus("Syncing players...");
+        else setStatus("All set!");
+
+        if (allDone && !loaderDoneRef.current) {
+            loaderDoneRef.current = true;
+            setTimeout(() => {
+                setShowPixelReveal(true);
+                setShowLoader(false);
+            }, 350);
+        }
+    };
+
+    useEffect(() => {
+        let lastGen = progressGenRef.current;
+        const id = setInterval(() => {
+            if (progressGenRef.current !== lastGen) {
+                lastGen = progressGenRef.current;
+                setPercentText(0);
+                return;
+            }
+            setPercentText(prev => {
+                const t = targetPctRef.current;
+                if (t <= prev) return prev;
+                const step = Math.max(1, Math.ceil((t - prev) * 0.2));
+                return Math.min(t, prev + step);
+            });
+        }, 80);
+        return () => clearInterval(id);
+    }, []);
+
+    const markDone = (k: Exclude<StageKey, "peers">) => {
+        if (!stageDoneRef.current[k]) {
+            stageDoneRef.current[k] = true;
+            recomputeProgress();
+        }
+    };
+
+    const setPeersTargets = (ids: string[]) => {
+        expectedPeersRef.current = new Set(ids);
+        connectedPeersRef.current.clear();
+        maxExpectedPeersRef.current = Math.max(maxExpectedPeersRef.current, ids.length || 1);
+        setStatus(ids.length > 1 ? "Syncing players..." : "Warming up...");
+        recomputeProgress();
+    };
+
+    const markPeerConnected = (peerId: string) => {
+        if (expectedPeersRef.current.has(peerId) && !connectedPeersRef.current.has(peerId)) {
+            connectedPeersRef.current.add(peerId);
+            recomputeProgress();
+        }
+    };
+
+    /** ===== INIT + join backend ===== */
+    const dialedPosRef = useRef<Set<string>>(new Set());
+
+    useEffect(() => {
+        if (!roomId) { navigate("/dashboard", { replace: true }); return; }
+        if (authLoading) return;
+        if (!isAuthenticated || !principalId) {
+            const nextPath = `/room/${roomId}`;
+            sessionStorage.setItem('next', nextPath);
+            setShowLoader(false);
+            setShowPixelReveal(false);
+            navigate(`/profile?next=${encodeURIComponent(nextPath)}`, { replace: true });
             return;
         }
 
-        console.log(`[ICE] Processing ${pending.length} pending ICE candidates for ${targetPrincipal}...`);
-
-        const failedCandidates: RTCIceCandidate[] = [];
-
-        for (const candidate of pending) {
-            try {
-                await peerData.pc.addIceCandidate(candidate);
-                console.log(`[ICE] Added pending ICE candidate for ${targetPrincipal}`);
-                await new Promise(resolve => setTimeout(resolve, 50));
-            } catch (error) {
-                console.error(`[ICE] Failed to add pending ICE candidate for ${targetPrincipal}:`, error);
-                failedCandidates.push(candidate);
-            }
+        if (needsMicGate) {
+            setShowLoader(false);
+            setShowPixelReveal(false);
+            return;
+        }
+        if (!nameReady) {
+            setShowLoader(true);
+            setShowPixelReveal(false);
+            setStatus("Getting your profile...");
+            return;
         }
 
-        // Update pending candidates
-        if (failedCandidates.length > 0) {
-            pendingICECandidates.current.set(targetPrincipal, failedCandidates);
-            console.log(`[ICE] ${failedCandidates.length} ICE candidates will be retried for ${targetPrincipal}`);
+        if (creatingRef.current || peerRef.current || closingRef.current) return;
+
+        creatingRef.current = true;
+        let cancelled = false;
+
+        setShowLoader(true);
+        setShowPixelReveal(false);
+        loaderDoneRef.current = false;
+        expectedPeersRef.current = new Set();
+        connectedPeersRef.current = new Set();
+        startProgressSession();
+        setStatus("Checking access...");
+        recomputeProgress();
+
+        (async () => {
+            try {
+                const jr = await joinRoom(roomId);
+                if (!("Ok" in jr)) { return; }
+                if (cancelled) return;
+                joinedRef.current = true;
+                markDone("join");
+                setStatus("Preparing the stage...");
+
+                const room = await getRoom(roomId);
+                const principals = (room?.participants || []).map(principalToText);
+                let targetsPeerIds = principals
+                    .filter((pt) => pt && pt !== myPrincipalTxt)
+                    .map((pt) => peerIdForPrincipal(roomId, pt));
+
+                if (targetsPeerIds.length === 0) targetsPeerIds = [myPeerId];
+
+                setPeersTargets(targetsPeerIds);
+
+                if (cancelled) return;
+
+                const peer = await createPeerWithRetry(myPeerId, 4);
+                if (!peer) {
+                    try { await leaveRoom(roomId); } catch { }
+                    joinedRef.current = false;
+                    return;
+                }
+                if (cancelled) { await destroyPeerCompletely(peer); return; }
+                peerRef.current = peer;
+                markDone("peerOpen");
+                setStatus("Almost there...");
+
+                if (expectedPeersRef.current.has(myPeerId)) {
+                    markPeerConnected(myPeerId);
+                }
+
+                ensureSelfInRoster();
+
+                for (const rid of targetsPeerIds) {
+                    if (rid === myPeerId) continue;
+                    if (connsRef.current.has(rid)) continue;
+
+                    const dc = peer.connect(rid, { label: "pos", reliable: true, serialization: "json" });
+                    dialedPosRef.current.add(rid);
+                    hookGameConn(rid, dc);
+
+                    const chat = peer.connect(rid, { label: "chat", reliable: true, serialization: "json" });
+                    hookChatConn(rid, chat);
+                }
+
+                const onConnection = (conn: DataConnection) => {
+                    const remotePeerId = conn.peer;
+                    if (conn.label === "pos") {
+                        rosterRef.current.set(remotePeerId, principalFromPeerId(roomId, remotePeerId));
+                        refreshRtcUI();
+                        hookGameConn(remotePeerId, conn);
+                        return;
+                    }
+                    if (conn.label === "chat") {
+                        hookChatConn(remotePeerId, conn);
+                        return;
+                    }
+                    hookGameConn(remotePeerId, conn);
+                };
+                const onDisconnected = () => {
+                    if (closingRef.current) return;
+                    try { peer.reconnect(); } catch { }
+                };
+                const onClose = () => log("Peer closed");
+                const onError = (err: any) => log(`Peer error: ${String(err?.message || err)}`);
+                const onCall = (call: MediaConnection) => {
+                    const rid = call.peer;
+                    rosterRef.current.set(rid, principalFromPeerId(roomId, rid));
+                    refreshRtcUI();
+                    void resolveRemoteProfile(rid);
+                    answerMediaCall(rid, call);
+                };
+
+                handlersRef.current = { onConnection, onDisconnected, onClose, onError, onCall };
+                peer.on("connection", onConnection);
+                peer.on("disconnected", onDisconnected);
+                peer.on("close", onClose);
+                peer.on("error", onError);
+                peer.on("call", onCall);
+            } finally {
+                creatingRef.current = false;
+            }
+        })();
+
+        const onPageHide = () => { void gracefulLeave(); };
+        const onBeforeUnload = () => { void gracefulLeave(); };
+        window.addEventListener("pagehide", onPageHide);
+        window.addEventListener("beforeunload", onBeforeUnload);
+
+        return () => {
+            cancelled = true;
+            window.removeEventListener("pagehide", onPageHide);
+            window.removeEventListener("beforeunload", onBeforeUnload);
+            void gracefulLeave();
+        };
+    }, [roomId, isAuthenticated, principalId, authLoading, myPeerId, nameReady, needsMicGate]);
+
+    /** Destroy Peer and wait for close */
+    const destroyPeerCompletely = (peer: Peer | null, timeoutMs = 1500) =>
+        new Promise<void>((resolve) => {
+            if (!peer) return resolve();
+            let done = false;
+            const finish = () => { if (!done) { done = true; resolve(); } };
+
+            try {
+                const h = handlersRef.current;
+                if (h.onConnection) peer.off("connection", h.onConnection);
+                if (h.onDisconnected) peer.off("disconnected", h.onDisconnected);
+                if (h.onClose) peer.off("close", h.onClose);
+                if (h.onError) peer.off("error", h.onError);
+                if (h.onCall) peer.off("call", h.onCall);
+                handlersRef.current = {};
+            } catch { }
+
+            const to = setTimeout(finish, timeoutMs);
+            const onClose = () => { clearTimeout(to); finish(); };
+            const onDisc = () => { clearTimeout(to); finish(); };
+            const onErr = () => { clearTimeout(to); finish(); };
+
+            try {
+                peer.once("close", onClose);
+                peer.once("disconnected", onDisc);
+                peer.once("error", onErr);
+                try { peer.disconnect(); } catch { }
+                try { peer.destroy(); } catch { }
+            } catch {
+                clearTimeout(to);
+                finish();
+            }
+        });
+
+    /** LEAVE */
+    const gracefulLeave = async () => {
+        if (closingRef.current) return;
+        closingRef.current = true;
+        try {
+            if (joinedRef.current) { try { await leaveRoom(roomId); } catch { } }
+            joinedRef.current = false;
+
+            for (const [, c] of connsRef.current) {
+                try { c.send({ t: "bye", peerId: myPeerId } as Msg); } catch { }
+                try { c.close(); } catch { }
+            }
+            for (const [, c] of chatConnsRef.current) { try { c.close(); } catch { } }
+            connsRef.current.clear(); chatConnsRef.current.clear();
+
+            for (const [, mc] of mediaConnsRef.current) { try { mc.close(); } catch { } }
+            mediaConnsRef.current.clear();
+
+            for (const k of Object.keys(remoteAudiosRef.current)) {
+                const el = remoteAudiosRef.current[k];
+                try { el?.pause(); if (el) (el as any).srcObject = null; el?.remove(); } catch { }
+                remoteAudiosRef.current[k] = null;
+            }
+            closeMic();
+
+            try { localSourceRef.current?.disconnect(); } catch { }
+            localSourceRef.current = null;
+            localAnalyserRef.current = null;
+
+            for (const k of Object.keys(remoteSourceRef.current)) {
+                try { remoteSourceRef.current[k]?.disconnect(); } catch { }
+                remoteSourceRef.current[k] = null;
+                remoteAnalyserRef.current[k] = null;
+            }
+
+            othersRef.current = {};
+            rosterRef.current.clear();
+            refreshRtcUI();
+
+            const p = peerRef.current;
+            await destroyPeerCompletely(p);
+            peerRef.current = null;
+
+            setChatLog([]);
+            chatBubbleRef.current = {};
+
+            await new Promise((r) => setTimeout(r, 250));
+        } finally {
+            creatingRef.current = false;
+            closingRef.current = false;
+        }
+    };
+
+    /** Helper: create Peer with a small retry if "ID is taken" */
+    const createPeerWithRetry = async (id: string, tries = 4): Promise<Peer | null> => {
+        for (let i = 0; i < tries; i++) {
+            const peer = new Peer(id, { debug: 1, config: rtcConfig });
+            const opened = await new Promise<boolean>((resolve) => {
+                const onOpen = () => { cleanup(); resolve(true); };
+                const onError = (err: any) => {
+                    const msg = String(err?.message || err);
+                    cleanup();
+                    if (/unavailable-id|is taken|taken/i.test(msg)) resolve(false);
+                    else { resolve(false); }
+                };
+                const cleanup = () => { peer.off("open", onOpen); peer.off("error", onError); };
+                peer.once("open", onOpen);
+                peer.once("error", onError);
+            });
+            if (opened) return peer;
+            try { await destroyPeerCompletely(peer); } catch { }
+            await new Promise((r) => setTimeout(r, 400 + i * 300));
+        }
+        return null;
+    };
+
+    /** hook Game DC */
+    const hookGameConn = (remotePeerId: string, conn: DataConnection) => {
+        connsRef.current.set(remotePeerId, conn);
+
+        conn.on("open", () => {
+            if (!rosterRef.current.has(remotePeerId)) {
+                rosterRef.current.set(remotePeerId, principalFromPeerId(roomId, remotePeerId));
+                refreshRtcUI();
+            }
+            void resolveRemoteProfile(remotePeerId);
+
+            markPeerConnected(remotePeerId);
+
+            try { conn.send({ t: "hello", peerId: myPeerId, principal: myPrincipalTxt } as Msg); } catch { }
+
+            try {
+                const movingNow = !!(keysRef.current.left || keysRef.current.right || keysRef.current.up || keysRef.current.down);
+                const face = faceDirRef.current[myPeerId] ?? 1;
+                conn.send({ t: "pos", x: meRef.current.x, y: meRef.current.y, moving: movingNow, face } as Msg);
+            } catch { }
+
+            try {
+                const slots = playerOutfitSlotsRef.current[myPeerId] || DEFAULT_OUTFIT;
+                const meta: MetaMsg = { t: "meta", outfit: slots };
+                const labelNow = myLabelRef.current;
+                if (labelNow) {
+                    meta.label = labelNow;
+                }
+                conn.send(meta);
+            } catch { }
+
+            try { conn.send({ t: "media-refresh", why: "manual" } as Msg); } catch { }
 
             setTimeout(() => {
-                processPendingICECandidates(targetPrincipal);
-            }, 2000);
-        } else {
-            pendingICECandidates.current.delete(targetPrincipal);
-            console.log(`[ICE] All pending ICE candidates processed for ${targetPrincipal}`);
-        }
+                try {
+                    const slots = playerOutfitSlotsRef.current[myPeerId] || DEFAULT_OUTFIT;
+                    const meta: MetaMsg = { t: "meta", outfit: slots, label: myLabelRef.current || undefined };
+                    conn.send(meta);
+                } catch { }
+            }, 500);
+
+            if (conn.label === "pos" && dialedPosRef.current.has(remotePeerId)) {
+                try { conn.send({ t: "door-sync-req" } as Msg); } catch { }
+            }
+
+            const peer = peerRef.current;
+            if (peer && !chatConnsRef.current.has(remotePeerId)) {
+                const dcChat = peer.connect(remotePeerId, { label: "chat", reliable: true, serialization: "json" });
+                hookChatConn(remotePeerId, dcChat);
+            }
+
+            startMediaCall(remotePeerId);
+        });
+
+        conn.on("data", (raw) => {
+            const m = raw as Msg;
+            if (!m || typeof m !== "object") return;
+
+            if (m.t === "hello") {
+                rosterRef.current.set(remotePeerId, (m as any).principal || principalFromPeerId(roomId, remotePeerId));
+                refreshRtcUI();
+            } else if (m.t === "meta") {
+                if (typeof m.label === "string") {
+                    labelCacheRef.current[remotePeerId] = m.label.trim().slice(0, 24);
+                }
+                if (Array.isArray((m as any).outfit)) {
+                    setOutfitSlotsFor(remotePeerId, (m as any).outfit);
+                }
+                setLabelsVersion(v => v + 1);
+                refreshRtcUI();
+            }
+            else if (m.t === "pos") {
+                othersRef.current[remotePeerId] = { x: m.x, y: m.y };
+                if (m.face === 1 || m.face === -1) faceDirRef.current[remotePeerId] = m.face;
+                if (typeof m.moving === "boolean") remoteMovingRef.current[remotePeerId] = m.moving;
+                lastPosAtRef.current[remotePeerId] = performance.now();
+            } else if (m.t === "bye") {
+                delete othersRef.current[remotePeerId];
+                connsRef.current.get(remotePeerId)?.close();
+                rosterRef.current.delete(remotePeerId);
+                refreshRtcUI();
+            } else if (m.t === "chat") {
+                handleInboundChat(remotePeerId, m);
+            } else if (m.t === "media-refresh") {
+                if (!mediaConnsRef.current.has(remotePeerId)) {
+                    startMediaCall(remotePeerId);
+                }
+            } else if (m.t === "door") {
+                void setDoor(m.col, m.row, m.open, { silent: !!m.silent });
+            } else if (m.t === "door-sync-req") {
+                sendDoorSnapshotTo(remotePeerId);
+            } else if (m.t === "spin") {
+                const dur = typeof m.dur === "number" ? m.dur : ARM_SPIN_MS;
+                triggerArmSpin(remotePeerId, dur);
+            }
+        });
+
+        conn.on("close", () => {
+            delete othersRef.current[remotePeerId];
+            connsRef.current.delete(remotePeerId);
+            rosterRef.current.delete(remotePeerId);
+            dialedPosRef.current.delete(remotePeerId);
+            refreshRtcUI();
+
+            try { mediaConnsRef.current.get(remotePeerId)?.close(); } catch { }
+            mediaConnsRef.current.delete(remotePeerId);
+            const el = remoteAudiosRef.current[remotePeerId];
+            try { el?.pause(); if (el) (el as any).srcObject = null; el?.remove(); } catch { }
+            remoteAudiosRef.current[remotePeerId] = null;
+
+            try { remoteSourceRef.current[remotePeerId]?.disconnect(); } catch { }
+            remoteSourceRef.current[remotePeerId] = null;
+            remoteAnalyserRef.current[remotePeerId] = null;
+            remoteLevelRef.current[remotePeerId] = 0;
+        });
+
+        conn.on("error", (err: any) => {
+            log(`DC(game) error ${pretty(remotePeerId)}: ${String(err?.message || err)}`);
+        });
     };
 
-    const sendICECandidate = async (candidate: RTCIceCandidate, targetPrincipal: string) => {
-        if (!roomId || !candidate) return;
+    /** hook Chat DC */
+    const hookChatConn = (remotePeerId: string, conn: DataConnection) => {
+        chatConnsRef.current.set(remotePeerId, conn);
+        conn.on("open", () => log(`DC(chat) open ${pretty(remotePeerId)}`));
+        conn.on("data", (raw) => {
+            try { const m = raw as Msg; if (m?.t === "chat") handleInboundChat(remotePeerId, m); } catch { }
+        });
+        conn.on("close", () => { log(`DC(chat) close ${pretty(remotePeerId)}`); chatConnsRef.current.delete(remotePeerId); });
+        conn.on("error", (err: any) => log(`DC(chat) error ${pretty(remotePeerId)}: ${String(err?.message || err)}`));
+    };
 
-        try {
-            const signal: Signal = {
-                from: Principal.fromText(principalId),
-                to: Principal.fromText(targetPrincipal),
-                kind: 'ice',
-                data: JSON.stringify({
-                    candidate: candidate.candidate,
-                    sdpMid: candidate.sdpMid,
-                    sdpMLineIndex: candidate.sdpMLineIndex,
-                    usernameFragment: candidate.usernameFragment
-                })
+
+
+    /** ===== Input & render loop ===== */
+    useEffect(() => {
+        const cvs = canvasRef.current; if (!cvs) return;
+        const DPR = window.devicePixelRatio || 1;
+
+        const resize = () => {
+            const w = window.innerWidth, h = window.innerHeight;
+            cvs.width = Math.floor(w * DPR);
+            cvs.height = Math.floor(h * DPR);
+            cvs.style.width = w + "px";
+            cvs.style.height = h + "px";
+
+            setZoomTarget(zoomTargetRef.current);
+        };
+
+        resize(); window.addEventListener("resize", resize);
+
+        const onPointerMove = (e: PointerEvent) => {
+            lastPointerRef.current.x = e.clientX;
+            lastPointerRef.current.y = e.clientY;
+        };
+        cvs.addEventListener("pointermove", onPointerMove, { passive: true });
+
+        const onWheel = (e: WheelEvent) => {
+            if (!(e.ctrlKey || e.metaKey)) return;
+            e.preventDefault();
+            const dir = -e.deltaY;
+            const factor = Math.exp(dir * WHEEL_SENS);
+            setZoomTarget(zoomTargetRef.current * factor);
+        };
+        cvs.addEventListener("wheel", onWheel, { passive: false });
+
+        // pointer gesture -> spin
+        const onDown = (e: PointerEvent) => {
+            if (e.button !== 0) return;
+            ensureAudioCtx()?.resume().catch(() => { });
+            triggerArmSpin(myPeerId);
+            const spin: SpinMsg = { t: "spin", dur: ARM_SPIN_MS };
+            for (const [, c] of connsRef.current) if (c.open) { try { c.send(spin); } catch { } }
+        };
+        cvs.addEventListener("pointerdown", onDown);
+
+        // anim state per peer
+        type AnimState = { phase: number; amp: number; lastX: number; lastY: number };
+        const animRef = { current: {} as Record<string, AnimState> };
+
+        const updateAnimFor = (pid: string, p: PlayerPos, dt: number, movingHint?: boolean): AnimSample => {
+            const st = (animRef.current[pid] ||= { phase: 0, amp: 0, lastX: p.x, lastY: p.y });
+            const dx = p.x - st.lastX;
+            const dy = p.y - st.lastY;
+            const speed = Math.hypot(dx, dy) / Math.max(dt, 1e-6);
+            const MOVING = movingHint ?? speed > 1;
+
+            const WALK_CPS = 2.5;
+            if (MOVING) st.phase += dt * (Math.PI * 2) * WALK_CPS;
+            if (st.phase > Math.PI * 2000) st.phase -= Math.PI * 2000;
+
+            const target = MOVING ? 1 : 0;
+            const ease = 8;
+            st.amp += (target - st.amp) * Math.min(1, dt * ease);
+
+            st.lastX = p.x; st.lastY = p.y;
+            return { phase: st.phase, amp: st.amp };
+        };
+
+        const step = (t: number) => {
+            let dt = (t - lastRef.current) / 1000;
+            if (dt > 0.05) dt = 0.05;
+            lastRef.current = t;
+
+            // Input / Movement
+            const k = keysRef.current;
+            let vx = 0, vy = 0;
+            if (k.left) vx -= 1;
+            if (k.right) vx += 1;
+            if (k.up) vy -= 1;
+            if (k.down) vy += 1;
+
+            if (vx || vy) {
+                const len = Math.hypot(vx, vy) || 1;
+                vx /= len; vy /= len;
+
+                const dx = vx * SPEED * dt;
+                const dy = vy * SPEED * dt;
+
+                const solved = resolveMove(
+                    meRef.current.x + HITBOX_LEFT,
+                    meRef.current.y + HITBOX_TOP,
+                    HITBOX_W, HITBOX_H,
+                    dx, dy
+                );
+
+                meRef.current.x = solved.x - HITBOX_LEFT;
+                meRef.current.y = solved.y - HITBOX_TOP;
+            }
+
+            // Face direction (left/right)
+            if (k.left && !k.right) faceDirRef.current[myPeerId] = -1;
+            else if (k.right && !k.left) faceDirRef.current[myPeerId] = 1;
+
+            // broadcast pos @15Hz
+            sendAccRef.current += dt;
+            if (sendAccRef.current >= 1 / 15) {
+                sendAccRef.current = 0;
+                broadcastPos();
+            }
+
+            /** ===== SPEAKING/VAD INDICATOR ===== */
+            const computeLevelNow = () => {
+                localLevelRef.current = computeLevel(localAnalyserRef.current);
+                for (const [rid, an] of Object.entries(remoteAnalyserRef.current)) {
+                    remoteLevelRef.current[rid] = computeLevel(an);
+                }
             };
-            await sendSignal(roomId, signal);
-            console.log(`[ICE] Sent ICE candidate to ${targetPrincipal}`);
-        } catch (err) {
-            console.error(`[ICE] Failed to send ICE candidate to ${targetPrincipal}:`, err);
-        }
-    };
+            computeLevelNow();
 
-    // ========== OFFER/ANSWER ==========
-    const sendOfferToUser = async (targetPrincipal: string) => {
-        const peerData = peerConnections.current.get(targetPrincipal);
-        if (!peerData || !roomId) return;
+            const nowMs = performance.now();
+            const BLINK = (pid: string, speaking: boolean) => {
+                const last = lastBlinkAtRef.current[pid] || 0;
+                if (speaking) {
+                    if (nowMs - last >= BLINK_MS) {
+                        talkBlinkRef.current[pid] = !talkBlinkRef.current[pid];
+                        lastBlinkAtRef.current[pid] = nowMs;
+                    }
+                } else {
+                    talkBlinkRef.current[pid] = false;
+                    lastBlinkAtRef.current[pid] = nowMs;
+                }
+            };
+            const SPK = (lvl: number) => (lvl || 0) > SPK_THRESHOLD;
+            BLINK(myPeerId, SPK(localLevelRef.current) || nowMs < (chatTalkUntilRef.current[myPeerId] || 0));
+            for (const rid of Object.keys(remoteLevelRef.current)) {
+                BLINK(rid, SPK(remoteLevelRef.current[rid]) || nowMs < (chatTalkUntilRef.current[rid] || 0));
+            }
 
-        try {
-            console.log(`[OFFER] Sending offer to ${targetPrincipal}...`);
+            // === Camera & Zoom === 
+            const DPR = window.devicePixelRatio || 1;
+            const cvs = canvasRef.current!;
+            const ctx = cvs.getContext("2d")!;
 
-            if (peerData.pc.signalingState !== 'stable') {
-                console.log(`[OFFER] Peer not ready for offer, state: ${peerData.pc.signalingState}`);
+            const viewW = cvs.width / DPR;
+            const viewH = cvs.height / DPR;
+
+            // smooth-lerp zoomActual -> zoomTarget
+            const zNow = zoomActualRef.current;
+            const zTgt = zoomTargetRef.current;
+            const zNext = zNow + (zTgt - zNow) * Math.min(1, dt * ZOOM_LERP);
+            zoomActualRef.current = zNext;
+
+            const z = zoomActualRef.current;
+
+            // World size after zoom (in screen px)
+            const worldWpx = CANVAS_W * z;
+            const worldHpx = CANVAS_H * z;
+
+            // Letterbox padding when world < viewport
+            const padX = Math.max(0, (viewW - worldWpx) / 2);
+            const padY = Math.max(0, (viewH - worldHpx) / 2);
+
+            // Viewport in world units (px), clamped to world
+            const vpW = Math.min(viewW / z, CANVAS_W);
+            const vpH = Math.min(viewH / z, CANVAS_H);
+
+            // Camera follows the player; clamped to world
+            let camX = 0, camY = 0;
+            const canScrollX = vpW < CANVAS_W;
+            const canScrollY = vpH < CANVAS_H;
+            const me = meRef.current;
+
+            if (canScrollX) camX = clamp(me.x + PLAYER / 2 - vpW / 2, 0, CANVAS_W - vpW);
+            if (canScrollY) camY = clamp(me.y + PLAYER / 2 - vpH / 2, 0, CANVAS_H - vpH);
+
+            // On-screen draw rect (rounded to avoid shimmer)
+            const destW = Math.floor(vpW * z);
+            const destH = Math.floor(vpH * z);
+            const dstX = Math.floor(padX);
+            const dstY = Math.floor(padY);
+
+            // === DRAW ===
+            ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+            ctx.imageSmoothingEnabled = false;
+            ctx.clearRect(0, 0, viewW, viewH);
+
+            const world = worldRef.current;
+
+            // Floor
+            if (world) {
+                ctx.drawImage(world.floor, camX, camY, vpW, vpH, dstX, dstY, destW, destH);
+            } else {
+                ctx.fillStyle = "#0b1220";
+                ctx.fillRect(0, 0, viewW, viewH);
+            }
+
+            // Build render list
+            type Renderable = {
+                pid: string;
+                sx: number; sy: number;
+                scale: number;
+                anim: AnimSample;
+                flipX: boolean;
+                label: string;
+                face: FaceState;
+                overrides?: { armFrontRot?: number; armBackRot?: number };
+            };
+            const renderList: Renderable[] = [];
+
+            const parts = partsRef.current;
+            const spriteScale = Math.ceil(PLAYER * z) / PLAYER;
+            const NET_LAG_GRACE_MS = 220;
+
+            // others
+            for (const [rid, p] of Object.entries(othersRef.current)) {
+                const sx = Math.floor(padX + (p.x - camX) * z);
+                const sy = Math.floor(padY + (p.y - camY) * z);
+
+                const movingHint =
+                    remoteMovingRef.current[rid] === true &&
+                    (nowMs - (lastPosAtRef.current[rid] || 0) < NET_LAG_GRACE_MS);
+
+                const anim = (window as any).noopAnim
+                    ? { phase: 0, amp: 0 }
+                    : updateAnimFor(rid, p, dt, movingHint);
+
+                const flipX = (faceDirRef.current[rid] ?? 1) === -1;
+                const speaking = SPK(remoteLevelRef.current[rid] || 0) || nowMs < (chatTalkUntilRef.current[rid] || 0);
+                const blink = speaking ? ((nowMs / 200) % 2 < 1 ? true : false) : !!talkBlinkRef.current[rid];
+
+                renderList.push({
+                    pid: rid,
+                    sx, sy,
+                    scale: spriteScale,
+                    anim,
+                    flipX,
+                    label: displayNameFor(rid),
+                    face: { speaking, talkBlink: blink },
+                    overrides: getArmSpinOverride(rid, flipX, nowMs),
+                });
+            }
+
+            // Local player
+            {
+                const p = meRef.current;
+                const sx = Math.floor(padX + (p.x - camX) * z);
+                const sy = Math.floor(padY + (p.y - camY) * z);
+
+                const anim = updateAnimFor(myPeerId, p, dt, !!(k.left || k.right || k.up || k.down));
+                const flipX = (faceDirRef.current[myPeerId] ?? 1) === -1;
+                const speaking = SPK(localLevelRef.current || 0) || nowMs < (chatTalkUntilRef.current[myPeerId] || 0);
+                const blink = speaking ? ((nowMs / 200) % 2 < 1 ? true : false) : !!talkBlinkRef.current[myPeerId];
+
+                renderList.push({
+                    pid: myPeerId,
+                    sx, sy,
+                    scale: spriteScale,
+                    anim,
+                    flipX,
+                    label: myLabelRef.current,
+                    face: { speaking, talkBlink: blink },
+                    overrides: getArmSpinOverride(myPeerId, flipX, nowMs),
+                });
+            }
+
+            // sort by Y for proper overlap
+            renderList.sort((a, b) => a.sy - b.sy);
+
+            // SHADOW PLAYERS
+            if (parts) {
+                for (const r of renderList) {
+                    drawPlayerShadow(ctx, parts, r.sx, r.sy, r.scale, r.anim, r.flipX, playerOutfitPartsRef.current[r.pid], r.face, r.overrides);
+                }
+            }
+
+            // WORLD SHADOW/WALL/OBJECT
+            if (world) {
+                ctx.drawImage(world.shadow, camX, camY, vpW, vpH, dstX, dstY, destW, destH);
+                ctx.drawImage(world.wall, camX, camY, vpW, vpH, dstX, dstY, destW, destH);
+                ctx.drawImage(world.object, camX, camY, vpW, vpH, dstX, dstY, destW, destH);
+            }
+
+            // PLAYERS
+            if (parts) {
+                for (const r of renderList) {
+                    drawPlayerSprite(ctx, parts, r.sx, r.sy, r.scale, r.anim, r.flipX, playerOutfitPartsRef.current[r.pid], r.face, r.overrides);
+                }
+            } else {
+                for (const r of renderList) {
+                    ctx.fillStyle = r.pid === myPeerId ? "#84cc16" : "#60a5fa";
+                    const wpx = Math.ceil(PLAYER * spriteScale);
+                    ctx.fillRect(r.sx, r.sy, wpx, wpx);
+                }
+            }
+
+            // OVER layer
+            if (world) {
+                ctx.drawImage(world.over, camX, camY, vpW, vpH, dstX, dstY, destW, destH);
+            }
+
+            // Labels and chat bubbles (scaled with zoom; pixel-snapped)
+            ctx.font = LABEL_FONT;
+            for (const r of renderList) {
+                // label
+                const name = r.label || "";
+                if (name) {
+                    ctx.save();
+                    ctx.fillStyle = "#e5e7eb";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "alphabetic";
+                    const labelX = r.sx + Math.ceil(PLAYER * r.scale) / 2;
+                    const labelY = Math.max(12, r.sy - 22);
+                    ctx.strokeStyle = LABEL_STROKE;
+                    ctx.lineWidth = 3;
+                    ctx.lineJoin = "round";
+                    try { ctx.strokeText(name, labelX, labelY); } catch { }
+                    try { ctx.fillText(name, labelX, labelY); } catch { }
+                    ctx.restore();
+                }
+
+                // bubble
+                const bubble = chatBubbleRef.current[r.pid];
+                if (bubble && nowMs < bubble.until) {
+                    const remain = (bubble.until - nowMs);
+                    const alpha = Math.max(0, Math.min(1, remain / 350));
+
+                    ctx.save();
+                    ctx.globalAlpha = 0.92 * alpha;
+                    ctx.font = BUBBLE_FONT;
+
+                    const paddingX = 8, paddingY = 6;
+                    const labelX = r.sx + Math.ceil(PLAYER * r.scale) / 2;
+                    const labelY = Math.max(12, r.sy - 22);
+
+                    const lines = wrapText(ctx, bubble.text, BUBBLE_MAX_W);
+                    const widths = lines.map((ln) => Math.ceil(ctx.measureText(ln).width));
+                    const boxW = Math.max(60, Math.min(BUBBLE_MAX_W, Math.max(...widths, 0))) + paddingX * 2;
+                    const boxH = lines.length * BUBBLE_LINE_H + paddingY * 2;
+
+                    const x = Math.floor(labelX - boxW / 2);
+                    const y = Math.floor(labelY - 10 - boxH);
+
+                    const radius = 6;
+                    ctx.beginPath();
+                    ctx.moveTo(x + radius, y);
+                    ctx.lineTo(x + boxW - radius, y);
+                    ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
+                    ctx.lineTo(x + boxW, y + boxH - radius);
+                    ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - radius, y + boxH);
+                    ctx.lineTo(x + radius, y + boxH);
+                    ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - radius);
+                    ctx.lineTo(x, y + radius);
+                    ctx.quadraticCurveTo(x, y, x + radius, y);
+                    ctx.closePath();
+
+                    ctx.fillStyle = "rgba(17,24,39,0.85)";
+                    ctx.fill();
+                    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+
+                    ctx.fillStyle = "white";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "top";
+                    let ty = y + paddingY;
+                    for (let i = 0; i < lines.length; i++) {
+                        ctx.fillText(lines[i], labelX, ty);
+                        ty += BUBBLE_LINE_H;
+                    }
+                    ctx.restore();
+                }
+            }
+
+            // Audio zone overlay (room/radius aware; matches letterbox)
+            if (micOn) {
+                const { col: meTx, row: meTy } = centerTileOf(meRef.current.x, meRef.current.y);
+                const myRule = audioRuleAt(meTx, meTy);
+
+                let audibleSet: Set<string> | null = null;
+                if (myRule.kind !== "room") {
+                    const myRadius = myRule.kind === "radius" ? myRule.radius : DEFAULT_AUDIO_RADIUS_TILES;
+                    audibleSet = computeAudibleTiles(meTx, meTy, myRadius);
+                }
+
+                const startCol = Math.max(0, Math.floor(camX / TILE));
+                const endCol = Math.min(MAP_COLS - 1, Math.floor((camX + vpW - 1e-6) / TILE));
+                const startRow = Math.max(0, Math.floor(camY / TILE));
+                const endRow = Math.min(MAP_ROWS - 1, Math.floor((camY + vpH - 1e-6) / TILE));
+
+                let ov = overlayCvsRef.current;
+                if (!ov) {
+                    ov = document.createElement("canvas");
+                    overlayCvsRef.current = ov;
+                }
+                if (ov.width !== destW || ov.height !== destH) {
+                    ov.width = destW;
+                    ov.height = destH;
+                }
+                const octx = (overlayCtxRef.current = ov.getContext("2d")!);
+                octx.setTransform(1, 0, 0, 1, 0, 0);
+                octx.imageSmoothingEnabled = false;
+                octx.clearRect(0, 0, destW, destH);
+
+                octx.globalCompositeOperation = "source-over";
+                octx.globalAlpha = 0.18;
+                octx.fillStyle = "#000";
+                octx.fillRect(0, 0, destW, destH);
+
+                octx.globalAlpha = 1;
+                octx.globalCompositeOperation = "destination-out";
+                octx.beginPath();
+
+                const rectForTile = (c: number, r: number) => {
+                    const x0 = Math.floor((c * TILE - camX) * z);
+                    const y0 = Math.floor((r * TILE - camY) * z);
+                    const w = Math.ceil(TILE * z);
+                    const h = Math.ceil(TILE * z);
+                    octx.rect(x0, y0, w, h);
+                };
+
+                for (let r = startRow; r <= endRow; r++) {
+                    for (let c = startCol; c <= endCol; c++) {
+                        if (myRule.kind === "room") {
+                            const rr = audioRuleAt(c, r);
+                            if (rr.kind === "room" && rr.zoneId === myRule.zoneId) rectForTile(c, r);
+                        } else {
+                            const rr = audioRuleAt(c, r);
+                            if (rr.kind !== "room" && audibleSet?.has(`${c},${r}`)) rectForTile(c, r);
+                        }
+                    }
+                }
+
+                octx.fill();
+
+                ctx.drawImage(ov, dstX, dstY);
+            }
+
+            updateAudioZones();
+
+            rafRef.current = requestAnimationFrame(step);
+        };
+
+        const kd = (e: KeyboardEvent) => {
+            if (isEditableTarget(e) || e.ctrlKey || e.metaKey || e.altKey) return;
+            const k = e.key.toLowerCase();
+
+            if (typingChatRef.current) {
+                if (
+                    k === "w" || k === "a" || k === "s" || k === "d" ||
+                    k === "arrowup" || k === "arrowdown" || k === "arrowleft" || k === "arrowright" ||
+                    k === "=" || k === "+" || k === "-" || k === "_" ||
+                    k === "x" || k === "c"
+                ) return;
+            }
+
+            if (k === "w" || k === "arrowup") keysRef.current.up = true;
+            if (k === "s" || k === "arrowdown") keysRef.current.down = true;
+            if (k === "a" || k === "arrowleft") keysRef.current.left = true;
+            if (k === "d" || k === "arrowright") keysRef.current.right = true;
+
+            if (k === "=" || k === "+") requestZoomIn();
+            if (k === "-" || k === "_") requestZoomOut();
+
+            if (k === "enter") {
+                const input = chatInputRef.current;
+                if (showChat) { input?.focus(); e.preventDefault(); }
+            }
+
+            if (k === "escape") {
+                if (showOutfit) {
+                    closeOutfit(false);
+                } else if (showMicSettings) {
+                    setShowMicSettings(false);
+                } else if (showChat) {
+                    setShowChat(false);
+                } else if (showSidebar) {
+                    setShowSidebar(false);
+                }
+            }
+
+            if (k === "c" && !e.repeat) {
+                setShowChat((v) => !v);
+                e.preventDefault();
                 return;
             }
 
-            const offer = await peerData.pc.createOffer({
-                offerToReceiveAudio: true,
-                offerToReceiveVideo: true
-            });
-
-            await peerData.pc.setLocalDescription(offer);
-            peerData.hasLocalDescription = true;
-            peerData.isOfferer = true;
-
-            const signal: Signal = {
-                from: Principal.fromText(principalId),
-                to: Principal.fromText(targetPrincipal),
-                kind: 'offer',
-                data: JSON.stringify(offer)
-            };
-
-            await sendSignal(roomId, signal);
-            console.log(`[OFFER] Sent offer to ${targetPrincipal}`);
-        } catch (err) {
-            console.error(`[OFFER] Error sending offer to ${targetPrincipal}:`, err);
-        }
-    };
-
-    // ========== ROOM MANAGEMENT ==========
-    const loadInitialRoomData = async () => {
-        if (!roomId) return;
-
-        setLoading(true);
-        try {
-            console.log('Loading initial room data for ID:', roomId);
-            const room = await getRoom(roomId);
-            if (!room) {
-                alert(`Room "${roomId}" not found`);
-                navigate('/dashboard');
-            }
-        } catch (error) {
-            console.error('Error loading initial room:', error);
-            alert(`Failed to load room data: ${error instanceof Error ? error.message : 'Unknown error'}`);
-            navigate('/dashboard');
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    // ========== UTILITY FUNCTIONS ==========
-    const copyRoomLink = () => {
-        const roomLink = `${window.location.origin}/room/${roomId}`;
-        navigator.clipboard.writeText(roomLink);
-        // Visual feedback
-        const button = document.activeElement as HTMLButtonElement;
-        if (button) {
-            const originalText = button.textContent;
-            button.textContent = 'Copied!';
-            setTimeout(() => {
-                if (button.textContent === 'Copied!') {
-                    button.textContent = originalText;
+            if (k === "x" && !e.repeat) {
+                const { col: tc, row: tr } = centerTileOf(meRef.current.x, meRef.current.y);
+                const adj = findAdjacentDoor(tc, tr);
+                if (adj) {
+                    const next = !adj.open;
+                    void setDoor(adj.col, adj.row, next);
+                    broadcastDoor(adj.col, adj.row, next);
+                    triggerArmSpin(myPeerId);
+                    const spin: SpinMsg = { t: "spin", dur: ARM_SPIN_MS };
+                    for (const [, c] of connsRef.current) if (c.open) { try { c.send(spin); } catch { } }
                 }
-            }, 2000);
-        }
-    };
+            }
+        };
 
-    const handleLeaveRoom = async () => {
-        if (!roomId) return;
+        const ku = (e: KeyboardEvent) => {
+            const k = e.key.toLowerCase();
+            if (typingChatRef.current) {
+                if (
+                    k === "w" || k === "a" || k === "s" || k === "d" ||
+                    k === "arrowup" || k === "arrowdown" || k === "arrowleft" || k === "arrowright"
+                ) return;
+            }
+            if (k === "w" || k === "arrowup") keysRef.current.up = false;
+            if (k === "s" || k === "arrowdown") keysRef.current.down = false;
+            if (k === "a" || k === "arrowleft") keysRef.current.left = false;
+            if (k === "d" || k === "arrowright") keysRef.current.right = false;
+        };
 
-        setLoading(true);
-        try {
-            cleanupAllPeerConnections();
-            cleanupLocalMedia();
-            stopPolling();
+        rafRef.current = requestAnimationFrame(step);
+        window.addEventListener("keydown", kd, true);
+        window.addEventListener("keyup", ku, true);
 
-            const result = await leaveRoom(roomId);
-            if ('Err' in result) {
-                alert(`Failed to leave room: ${result.Err}`);
+        return () => {
+            cancelAnimationFrame(rafRef.current);
+            window.removeEventListener("resize", resize);
+            window.removeEventListener("keydown", kd, true);
+            window.removeEventListener("keyup", ku, true);
+            cvs.removeEventListener("pointerdown", onDown);
+            cvs.removeEventListener("pointermove", onPointerMove);
+            cvs.removeEventListener("wheel", onWheel as any);
+        };
+    }, [myPeerId, micOn, myDisplayName]);
+
+    /** ===== Small avatar head (for participants) ===== */
+    const AvatarHead: React.FC<{ pid: string; name: string; size?: number; ring?: boolean }> = ({
+        pid, name, size = 32, ring = true
+    }) => {
+        const ref = useRef<HTMLCanvasElement | null>(null);
+        const offRef = useRef<HTMLCanvasElement | null>(null);
+
+        const draw = React.useCallback(() => {
+            const cvs = ref.current; if (!cvs) return;
+
+            const dpr = window.devicePixelRatio || 1;
+            cvs.width = size * dpr; cvs.height = size * dpr;
+            cvs.style.width = `${size}px`; cvs.style.height = `${size}px`;
+
+            const ctx = cvs.getContext("2d")!;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.imageSmoothingEnabled = false;
+            ctx.clearRect(0, 0, size, size);
+
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(size / 2, size / 2, size / 2 - 1, 0, Math.PI * 2);
+            ctx.closePath();
+            ctx.clip();
+
+            const parts = partsRef.current;
+            const outfit = playerOutfitPartsRef.current[pid];
+
+            if (parts && outfit) {
+                const scale = 4;
+                let off = offRef.current;
+                if (!off) {
+                    off = document.createElement("canvas");
+                    offRef.current = off;
+                }
+                off.width = PLAYER * scale;
+                off.height = PLAYER * scale;
+                const octx = off.getContext("2d")!;
+                octx.setTransform(1, 0, 0, 1, 0, 0);
+                octx.imageSmoothingEnabled = false;
+                octx.clearRect(0, 0, off.width, off.height);
+
+                const speaking = !!speakingRef.current[pid];
+                const blink = !!talkBlinkRef.current[pid];
+
+                drawPlayerSprite(
+                    octx, parts,
+                    0, 0, scale,
+                    { phase: 0, amp: 0 },
+                    false,
+                    outfit,
+                    { speaking, talkBlink: blink }
+                );
+
+                const sx = HEAD_BOX.x * scale;
+                const sy = HEAD_BOX.y * scale;
+                const sw = HEAD_BOX.w * scale;
+                const sh = HEAD_BOX.h * scale;
+                ctx.drawImage(off, sx, sy, sw, sh, 0, 0, size, size);
             } else {
-                navigate('/dashboard');
+                ctx.fillStyle = "rgba(255,255,255,0.06)";
+                ctx.fillRect(0, 0, size, size);
+                ctx.fillStyle = "#a3e635";
+                ctx.font = `${Math.floor(size * 0.45)}px ui-sans-serif,system-ui,Segoe UI`;
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(String(name || "").slice(0, 1).toUpperCase(), size / 2, size / 2 + 1);
             }
-        } catch (error) {
-            console.error('Leave room error:', error);
-            alert('Failed to leave room');
-        } finally {
-            setLoading(false);
-        }
+
+            ctx.restore();
+
+            if (ring) {
+                ctx.strokeStyle = "rgba(163,230,53,0.6)";
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.arc(size / 2, size / 2, size / 2 - 0.75, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+        }, [pid, name, size]);
+
+        useEffect(() => {
+            let raf = 0;
+            let last = 0;
+            const tick = (ts: number) => {
+                if (ts - last > 100) {
+                    last = ts;
+                    draw();
+                }
+                raf = requestAnimationFrame(tick);
+            };
+            draw();
+            raf = requestAnimationFrame(tick);
+            return () => cancelAnimationFrame(raf);
+        }, [pid, draw, labelsVersion]);
+
+        return <canvas ref={ref} style={{ display: "block" }} aria-label={`${name} avatar`} />;
     };
 
-    // ========== EFFECTS ==========
-    useEffect(() => {
-        if (roomId && isUserReady && !roomData) {
-            loadInitialRoomData();
-        }
-    }, [roomId, isUserReady, roomData]);
+    /** ===== Participant row in sidebar ===== */
+    const ParticipantRow: React.FC<{ pid: string }> = React.memo(({ pid }) => {
+        const name = displayNameFor(pid);
+        const uname = usernameFor(pid);
+        const isSelf = pid === myPeerId;
 
-    useEffect(() => {
-        if (roomData && isUserReady) {
-            initializeAutomaticWebRTC();
-        }
-    }, [roomData, isUserReady]);
+        const badgeRef = useRef<HTMLSpanElement | null>(null);
+        useEffect(() => {
+            const id = setInterval(() => {
+                const el = badgeRef.current; if (!el) return;
+                const spk = !!speakingRef.current[pid];
+                el.style.opacity = spk ? "1" : "0";
+                el.style.visibility = spk ? "visible" : "hidden";
+            }, 120);
+            return () => clearInterval(id);
+        }, [pid]);
 
-    useEffect(() => {
-        if (roomData && isUserReady) {
-            handleParticipantChanges();
-        }
-    }, [participants, principalId, roomData]);
-
-    useEffect(() => {
-        const preventReload = (event: BeforeUnloadEvent) => {
-            // Prevent reload/close
-            event.preventDefault();
-            event.returnValue = ''; // Chrome requires returnValue to be set
-
-            // Custom message (modern browsers may not show this)
-            return 'Are you sure you want to leave this video call? You will be disconnected from the room.';
-        };
-
-        const preventKeyboardReload = (event: KeyboardEvent) => {
-            // Prevent F5
-            if (event.key === 'F5') {
-                event.preventDefault();
-                return false;
-            }
-
-            // Prevent Ctrl+R / Cmd+R
-            if ((event.ctrlKey || event.metaKey) && event.key === 'r') {
-                event.preventDefault();
-                return false;
-            }
-
-            // Prevent Ctrl+F5 (hard reload)
-            if (event.ctrlKey && event.key === 'F5') {
-                event.preventDefault();
-                return false;
-            }
-
-            // Prevent Ctrl+Shift+R (hard reload)
-            if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key === 'R') {
-                event.preventDefault();
-                return false;
-            }
-        };
-
-        const preventContextMenu = (event: MouseEvent) => {
-            // Prevent right-click menu (which has reload option)
-            event.preventDefault();
-            return false;
-        };
-
-        // Add event listeners
-        window.addEventListener('beforeunload', preventReload);
-        document.addEventListener('keydown', preventKeyboardReload);
-        document.addEventListener('contextmenu', preventContextMenu);
-
-        return () => {
-            window.removeEventListener('beforeunload', preventReload);
-            document.removeEventListener('keydown', preventKeyboardReload);
-            document.removeEventListener('contextmenu', preventContextMenu);
-        };
-    }, []);
-
-    useEffect(() => {
-        return () => {
-            console.log('[UNMOUNT] Component unmounting - cleaning up...');
-            cleanupAllPeerConnections();
-            cleanupLocalMedia();
-        };
-    }, []);
-
-    useEffect(() => {
-        if (isUserReady) {
-            enumerateDevices();
-        }
-    }, [isUserReady]);
-
-    useEffect(() => {
-        if (showAITranslate && isUserReady) {
-            initializeSpeechRecognition();
-        }
-
-        return () => {
-            shouldRestartSpeechRef.current = false;
-            if (speechRecognitionRef.current) {
-                speechRecognitionRef.current.stop();
-            }
-        };
-    }, [showAITranslate, isUserReady]);
-
-
-    // ========== RENDER CONDITIONS ==========
-    if (authLoading || loading || roomLoading) {
         return (
-            <div className="min-h-screen bg-black flex items-center justify-center">
-                <motion.div
-                    initial={{ opacity: 0, scale: 0.8 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    className="text-center"
-                >
-                    <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-lime-400 mx-auto mb-6"></div>
-                    <div className="text-white text-xl">
-                        {loading ? 'Connecting to room...' : 'Loading...'}
-                    </div>
-                    <div className="text-gray-400 text-sm mt-2">
-                        Setting up your video connection
-                    </div>
-                </motion.div>
-            </div>
-        );
-    }
-
-    if (!isAuthenticated) {
-        return (
-            <LoginRequired
-                onLogin={login}
-                isLoading={authLoading}
-                title="Join Video Room"
-                subtitle="Authentication Required"
-                description="Please authenticate with Internet Identity to join this video room"
-                showFeatures={false}
-            />
-        );
-    }
-
-
-    if (!user?.username) {
-        return (
-            <ProfileSetupRequired
-                onComplete={() => navigate('/profile')}
-                isLoading={authLoading}
-            />
-        );
-    }
-
-    if (!roomData && !loading && !realtimeLoading) {
-        return (
-            <div className="min-h-screen bg-black text-white overflow-hidden relative">
-                <TargetCursor targetSelector=".cursor-target" spinDuration={2} hideDefaultCursor={true} />
-
-                <InteractiveGridPattern
-                    className={cn(
-                        "[mask-image:radial-gradient(800px_circle_at_center,white,transparent)]",
-                        "absolute inset-0 h-full w-full z-0",
-                        "fill-red-500/10 stroke-red-500/10"
-                    )}
-                    width={20}
-                    height={20}
-                    squares={[80, 80]}
-                    squaresClassName="hover:fill-red-500/20"
-                />
-
-                <div className="absolute inset-0 z-[1] pointer-events-none">
-                    <div className="absolute inset-0 bg-gradient-to-b from-black/70 via-transparent to-black/50" />
-                    <div className="absolute inset-0 bg-gradient-to-r from-red-500/5 via-transparent to-purple-500/5" />
+            <li className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-white/5 transition">
+                <div className="shrink-0">
+                    <AvatarHead pid={pid} name={name || prettyId(pid)} size={32} />
                 </div>
 
-                <div className="relative z-10 flex items-center justify-center min-h-screen px-4">
-                    <motion.div
-                        initial={{ opacity: 0, scale: 0.9 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        className="text-center max-w-md"
+                <div className="min-w-0 flex-1">
+                    <div className="text-sm text-white truncate">
+                        {isSelf ? `${name} (you)` : name}
+                    </div>
+                    <div className="text-[11px] text-slate-400 font-mono truncate">
+                        @{uname || prettyId(principalFromPeerId(roomId, pid))}
+                    </div>
+                </div>
+
+                <div className="ml-2">
+                    <span
+                        ref={badgeRef}
+                        className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border transition-opacity duration-150
+                                    bg-emerald-600/20 text-emerald-300 border-emerald-500/30
+                                    opacity-0 invisible`}
+                        title="Currently speaking"
                     >
-                        <div className="w-20 h-20 bg-red-400/20 rounded-full flex items-center justify-center mx-auto mb-6 border border-red-400/30">
-                            <AlertTriangle className="h-10 w-10 text-red-400" />
-                        </div>
-                        <h1 className="text-3xl font-bold text-white mb-4">Room Not Found</h1>
-                        <p className="text-gray-300 mb-6">
-                            The room "{roomId}" doesn't exist or has been deleted.
-                        </p>
-                        <div className="space-y-3">
-                            <Button
-                                onClick={() => navigate('/dashboard')}
-                                className="w-full bg-lime-400 text-black hover:bg-lime-500 cursor-target"
-                            >
-                                Back to Dashboard
-                            </Button>
-                            <Button
-                                onClick={() => navigate('/')}
-                                variant="outline"
-                                className="w-full border-gray-600 text-gray-300 hover:bg-gray-700 cursor-target"
-                            >
-                                Go Home
-                            </Button>
-                        </div>
-                    </motion.div>
+                        speaking
+                    </span>
                 </div>
-            </div>
+            </li>
         );
-    }
+    });
 
-    // ========== MAIN RENDER ==========
-    return (
-        <div className="min-h-screen bg-black text-white overflow-hidden relative">
-            {/* Target Cursor */}
-            <TargetCursor targetSelector=".cursor-target" spinDuration={2} hideDefaultCursor={true} />
+    /** ===== Mobile Joystick ===== */
+    const MobileJoystick: React.FC = () => {
+        const baseRef = useRef<HTMLDivElement | null>(null);
+        const [dragging, setDragging] = useState(false);
+        const [knob, setKnob] = useState({ x: 0, y: 0 });
 
-            {/* Interactive Grid Background */}
-            <InteractiveGridPattern
-                className={cn(
-                    "[mask-image:radial-gradient(1000px_circle_at_center,white,transparent)]",
-                    "absolute inset-0 h-full w-full z-0",
-                    "fill-lime-500/5 stroke-lime-500/5"
-                )}
-                width={20}
-                height={20}
-                squares={[100, 100]}
-                squaresClassName="hover:fill-lime-500/10"
-            />
+        const applyVector = (nx: number, ny: number) => {
+            if (typingChatRef.current) return;
+            const dead = 0.18;
+            keysRef.current.left = nx < -dead;
+            keysRef.current.right = nx > dead;
+            keysRef.current.up = ny < -dead;
+            keysRef.current.down = ny > dead;
+        };
 
-            {/* Overlay */}
-            <div className="absolute inset-0 z-[1] pointer-events-none">
-                <div className="absolute inset-0 bg-gradient-to-b from-black/80 via-transparent to-black/80" />
-                <div className="absolute inset-0 bg-gradient-to-r from-lime-500/3 via-transparent to-purple-500/3" />
-            </div>
+        const updateFromClient = (cx: number, cy: number) => {
+            const el = baseRef.current;
+            if (!el) return;
+            const r = el.getBoundingClientRect();
+            const centerX = r.left + r.width / 2;
+            const centerY = r.top + r.height / 2;
+            let dx = cx - centerX;
+            let dy = cy - centerY;
+            const max = Math.min(r.width, r.height) / 2;
+            const len = Math.hypot(dx, dy) || 1;
+            const clamped = Math.min(len, max);
+            const nx = (dx / len) * (clamped / max);
+            const ny = (dy / len) * (clamped / max);
+            setKnob({ x: nx, y: ny });
+            applyVector(nx, ny);
+        };
 
-            {/* Header */}
-            <motion.header
-                initial={{ opacity: 0, y: -20 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={smoothTransition}
-                className="fixed top-0 w-full z-50 bg-black/80 backdrop-blur-md border-b border-lime-500/20"
+        const reset = () => {
+            setKnob({ x: 0, y: 0 });
+            applyVector(0, 0);
+        };
+
+        useEffect(() => {
+            const mv = (e: PointerEvent) => { if (dragging) updateFromClient(e.clientX, e.clientY); };
+            const up = () => { setDragging(false); reset(); };
+            window.addEventListener("pointermove", mv, { passive: true });
+            window.addEventListener("pointerup", up, { passive: true });
+            window.addEventListener("pointercancel", up, { passive: true });
+            return () => {
+                window.removeEventListener("pointermove", mv);
+                window.removeEventListener("pointerup", up);
+                window.removeEventListener("pointercancel", up);
+            };
+        }, [dragging]);
+
+        const knobPx = (pct: number, size: number) => (size / 2) * pct;
+
+        const BASE_SIZE = 140;
+        const KNOB_SIZE = 64;
+
+        return (
+            <div
+                data-no-dismiss
+                className="absolute left-6 bottom-6 select-none z-[44]"
+                style={{ touchAction: "none" }}
             >
-                <div className="container mx-auto px-4 h-16 flex items-center justify-between">
-                    <motion.div
-                        className="flex items-center space-x-4 cursor-target"
-                        whileHover={{ scale: 1.05 }}
-                        transition={{ type: "spring", stiffness: 400, damping: 17 }}
-                    >
-                        <h1 className="font-logo text-2xl text-lime-400 m-0">
-                            PIXELIY
-                        </h1>
-                        <div className="hidden md:block h-6 w-px bg-lime-400/0"></div>
-                        <div className="hidden md:block">
-                            <p className="text-sm text-gray-400">Room</p>
-                            <p className="text-sm font-semibold text-white">{roomId}</p>
-                        </div>
-                    </motion.div>
-
-                    <nav className="hidden lg:flex items-center space-x-6">
-                        <div className="flex items-center space-x-2">
-                            <Users className="w-4 h-4 text-gray-400" />
-                            <span className="text-sm text-gray-400">{participants.length} participants</span>
-                        </div>
-                    </nav>
-
-                    <motion.div
-                        className="flex items-center space-x-3"
-                        initial={{ opacity: 0, x: 20 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        transition={{ delay: 0.4 }}
-                    >
-                        <Button
-                            variant="outline"
-                            size="sm"
-                            className="border-lime-400/20 text-lime-400 hover:bg-lime-400/10 cursor-target"
-                            onClick={copyRoomLink}
-                        >
-                            <Copy className="w-4 h-4 mr-2" />
-                            <span className="hidden md:inline">Copy Link</span>
-                        </Button>
-                        <Button
-                            variant="destructive"
-                            size="sm"
-                            className="cursor-target"
-                            onClick={handleLeaveRoom}
-                        >
-                            <PhoneOff className="w-4 h-4 mr-2" />
-                            <span className="hidden md:inline">Leave</span>
-                        </Button>
-                    </motion.div>
-                </div>
-            </motion.header>
-
-            {/* Error Display */}
-            {(authError || roomError || realtimeError) && (
-                <motion.div
-                    className="fixed top-20 left-4 right-4 z-40"
-                    initial={{ opacity: 0, y: -20 }}
-                    animate={{ opacity: 1, y: 0 }}
+                <div
+                    ref={baseRef}
+                    onPointerDown={(e) => {
+                        e.preventDefault();
+                        (e.currentTarget as any).setPointerCapture?.(e.pointerId);
+                        setDragging(true);
+                        updateFromClient(e.clientX, e.clientY);
+                    }}
+                    className="relative rounded-full border backdrop-blur-md border-white/15 bg-white/5"
+                    style={{ width: BASE_SIZE, height: BASE_SIZE }}
+                    aria-label="Move joystick"
                 >
-                    <div className="max-w-md mx-auto bg-red-500/20 border border-red-500/50 rounded-xl p-4 backdrop-blur-md">
-                        <p className="text-red-300 flex items-center text-sm">
-                            <AlertTriangle className="w-4 h-4 mr-2" />
-                            {authError || roomError || realtimeError}
-                        </p>
+                    {/* crosshair */}
+                    <div className="absolute inset-0 pointer-events-none" aria-hidden>
+                        <div className="absolute left-1/2 top-0 -translate-x-1/2 w-px h-full bg-white/10" />
+                        <div className="absolute top-1/2 left-0 -translate-y-1/2 h-px w-full bg-white/10" />
+                        <div className="absolute inset-0 rounded-full border border-white/10" />
                     </div>
-                </motion.div>
-            )}
 
-            {/* Main Video Area */}
-            <main className="pt-16 h-screen flex flex-col relative z-10">
-                {roomData && (
+                    {/* knob */}
+                    <div
+                        className="absolute rounded-full border shadow-md bg-white/30 border-white/30"
+                        style={{
+                            width: KNOB_SIZE,
+                            height: KNOB_SIZE,
+                            left: `calc(50% - ${KNOB_SIZE / 2}px + ${knobPx(knob.x, BASE_SIZE)}px)`,
+                            top: `calc(50% - ${KNOB_SIZE / 2}px + ${knobPx(knob.y, BASE_SIZE)}px)`,
+                            transition: dragging ? "none" : "left 120ms ease, top 120ms ease",
+                            willChange: "left, top",
+                        }}
+                    />
+                </div>
+            </div>
+        );
+    };
+
+    const IconButton: React.FC<{
+        title: string;
+        active?: boolean;
+        danger?: boolean;
+        onClick?: () => void;
+        children: React.ReactNode;
+        badge?: number | string;
+        badgeSrOnly?: string;
+    } & React.ButtonHTMLAttributes<HTMLButtonElement>> = ({
+        title, active, danger, onClick, children, className, badge, badgeSrOnly, ...rest
+    }) => {
+            const variant = danger
+                ? "bg-rose-500/25 border-rose-400/60 text-rose-50 hover:bg-rose-500/35"
+                : active
+                    ? "bg-lime-400/25 border-lime-300/60 text-lime-50 hover:bg-lime-400/35"
+                    : "bg-white/5 border-white/15 text-white hover:bg-white/10";
+
+            const hasBadge =
+                badge !== undefined &&
+                badge !== null &&
+                String(badge).trim() !== "" &&
+                Number(badge) > 0;
+
+            return (
+                <button
+                    {...rest}
+                    onClick={onClick}
+                    data-no-dismiss
+                    title={title}
+                    aria-pressed={!!active}
+                    className={[
+                        "relative inline-flex items-center justify-center h-9 w-9 rounded-lg border transition",
+                        "backdrop-blur-md focus:outline-none focus:ring-2 focus:ring-white/20",
+                        variant,
+                        className || ""
+                    ].join(" ")}
+                >
+                    {children}
+
+                    {hasBadge && (
+                        <>
+                            <span
+                                aria-hidden
+                                className="pointer-events-none absolute -top-2 -right-2 min-w-[18px] h-[18px] px-1
+                                            rounded-full grid place-items-center text-[10px] font-semibold
+                                            bg-lime-400 text-white border border-lime-300 shadow"
+                            >
+                                {typeof badge === "number" ? formatBadge(badge) : String(badge)}
+                            </span>
+                            {badgeSrOnly ? <span className="sr-only">{badgeSrOnly}</span> : null}
+                        </>
+                    )}
+
+                </button>
+            );
+        };
+
+    // Mic button with split settings toggle
+    const micVariantClasses = (active?: boolean, danger?: boolean) =>
+        danger
+            ? "bg-rose-500/25 border-rose-400/60 text-rose-50"
+            : active
+                ? "bg-lime-400/25 border-lime-300/60 text-lime-50"
+                : "bg-white/5 border-white/15 text-white";
+
+    // Mic split button (main + dropdown)
+    const MicSplitButton: React.FC<{
+        active: boolean;
+        danger: boolean;
+        onToggle: () => void;
+        onToggleSettings: () => void;
+        expanded?: boolean;
+    }> = ({ active, danger, onToggle, onToggleSettings, expanded }) => {
+        const variant = micVariantClasses(active, danger);
+
+        return (
+            <div
+                data-no-dismiss
+                className={[
+                    "inline-flex items-stretch rounded-lg overflow-hidden border backdrop-blur-md",
+                    "focus-within:ring-2 focus-within:ring-white/20",
+                    variant
+                ].join(" ")}
+                role="group"
+                aria-label="Microphone controls"
+            >
+                <button
+                    type="button"
+                    data-no-dismiss
+                    onClick={onToggle}
+                    title="Mic on/off"
+                    aria-pressed={active}
+                    className="inline-flex items-center justify-center h-9 w-9 hover:bg-white/10 focus:outline-none transition"
+                >
+                    {active ? <IconMicOn className="w-5 h-5" /> : <IconMicOff className="w-5 h-5" />}
+                </button>
+
+                <div className="w-px my-1 self-stretch bg-white/15" aria-hidden />
+
+                <button
+                    type="button"
+                    data-no-dismiss
+                    onClick={onToggleSettings}
+                    title={expanded ? "Hide mic settings" : "Mic settings"}
+                    aria-haspopup="dialog"
+                    aria-expanded={!!expanded}
+                    className="inline-flex items-center justify-center h-9 w-7 hover:bg-white/10 focus:outline-none transition"
+                >
+                    {expanded ? <IconChevronUp className="w-4 h-4" /> : <IconChevronDown className="w-4 h-4" />}
+                </button>
+            </div>
+        );
+    };
+
+    /** ===== UI ===== */
+    return (
+        <div className="fixed inset-0 bg-black">
+            {shouldRenderGate && (
+                <AnimatePresence>
                     <motion.div
-                        initial={{ opacity: 0, scale: 0.95 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        transition={{ duration: 0.6 }}
-                        className="flex-1 flex flex-col"
-                    >
-                        {/* Video Grid Container */}
-                        <div className="flex-1 p-4">
-                            <div className="h-full max-w-7xl mx-auto">
-                                {/* Dynamic Video Grid */}
-                                {(() => {
-                                    const totalVideos = connectedPeers.length + 1; // Include local video
-                                    const { cols, rows } = getVideoGridLayout(totalVideos);
-
-                                    const containerHeight = window.innerHeight - 200; // Account for header/controls
-                                    const containerWidth = Math.min(window.innerWidth - 32, 1280); // Max width with padding
-
-                                    const videoWidth = containerWidth / cols;
-
-                                    const aspectRatio = 16 / 9;
-                                    let finalVideoWidth = videoWidth;
-                                    let finalVideoHeight = videoWidth / aspectRatio;
-
-                                    // If height exceeds available space, scale down
-                                    if (finalVideoHeight * rows > containerHeight) {
-                                        finalVideoHeight = containerHeight / rows;
-                                        finalVideoWidth = finalVideoHeight * aspectRatio;
-                                    }
-
-                                    return (
-                                        <motion.div
-                                            initial={{ opacity: 0 }}
-                                            animate={{ opacity: 1 }}
-                                            transition={{ delay: 0.3, duration: 0.6 }}
-                                            className="gap-4"
-                                            style={{
-                                                display: 'grid',
-                                                gridTemplateColumns: `repeat(${cols}, ${finalVideoWidth}px)`,
-                                                gridTemplateRows: `repeat(${rows}, ${finalVideoHeight}px)`,
-                                                justifyContent: 'center',
-                                                alignContent: 'center',
-                                                width: '100%',
-                                                height: `${containerHeight}px`
-                                            }}
-                                        >
-                                            {/* Local Video */}
-                                            <motion.div
-                                                initial={{ opacity: 0, scale: 0.9 }}
-                                                animate={{ opacity: 1, scale: 1 }}
-                                                transition={{ delay: 0.2 }}
-                                                className="relative group w-full"
-                                                style={{ aspectRatio: '16/9' }}
-                                            >
-                                                <div className="relative w-full h-full bg-gray-800/50 rounded-xl overflow-hidden border border-gray-600/50 hover:border-green-400/50 transition-all">
-                                                    {/* Apply consistent gradient background like remote videos */}
-                                                    <div
-                                                        className="absolute inset-0 z-0"
-                                                        style={{
-                                                            background: 'linear-gradient(145deg, rgba(55, 65, 81, 0.5), rgba(75, 85, 99, 0.5))',
-                                                            boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)'
-                                                        }}
-                                                    />
-
-                                                    <video
-                                                        ref={localVideoRef}
-                                                        autoPlay
-                                                        muted
-                                                        playsInline
-                                                        className="relative z-10 w-full h-full object-cover"
-                                                    />
-
-                                                    {/* Camera Off Overlay */}
-                                                    {!isCameraEnabled && (
-                                                        <motion.div
-                                                            initial={{ opacity: 0 }}
-                                                            animate={{ opacity: 1 }}
-                                                            className="absolute inset-0 z-20 flex items-center justify-center bg-gray-800/90 backdrop-blur-sm"
-                                                        >
-                                                            <div className="text-center text-gray-300">
-                                                                <VideoOff className="w-12 h-12 mx-auto mb-3 text-gray-400" />
-                                                                <div className="text-sm font-medium">Camera off</div>
-                                                            </div>
-                                                        </motion.div>
-                                                    )}
-
-                                                    {/* Top Left - Participant Badge (consistent with remote videos) */}
-                                                    <div className="absolute top-3 left-3 z-30">
-                                                        <div className="bg-green-500/20 text-green-300 border border-green-500/30 text-xs px-2 py-1 rounded backdrop-blur-sm">
-                                                            <div className="w-2 h-2 bg-green-400 rounded-full mr-2 animate-pulse" style={{ display: 'inline-block' }}></div>
-                                                            You
-                                                        </div>
-                                                    </div>
-
-                                                    {/* Top Right - Connection Status & Media Status */}
-                                                    <div className="absolute top-3 right-3 z-30 flex items-center space-x-2">
-                                                        {/* Connection Status Indicator */}
-                                                        <div className="w-3 h-3 bg-green-400 rounded-full border-2 border-white animate-pulse"></div>
-
-                                                        {/* Media Status Icons */}
-                                                        {!isCameraEnabled && (
-                                                            <div className="w-6 h-6 bg-red-500/20 rounded-full flex items-center justify-center border border-red-500/30">
-                                                                <VideoOff className="w-3 h-3 text-red-400" />
-                                                            </div>
-                                                        )}
-                                                        {!isMicrophoneEnabled && (
-                                                            <div className="w-6 h-6 bg-red-500/20 rounded-full flex items-center justify-center border border-red-500/30">
-                                                                <MicOff className="w-3 h-3 text-red-400" />
-                                                            </div>
-                                                        )}
-                                                    </div>
-
-                                                    {/* Bottom Left - User Label (consistent with remote videos) */}
-                                                    <div className="absolute bottom-3 left-3 z-30">
-                                                        <div className="bg-black/70 text-white text-xs px-2 py-1 rounded backdrop-blur-sm border border-white/20">
-                                                            {String(user?.name || '').trim() || String(user?.username || '').trim()}
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            </motion.div>
-
-                                            {/* Remote Videos Container */}
-                                            <div
-                                                ref={remoteVideosContainerRef}
-                                                className="contents"
-                                            >
-                                                {/* Remote videos will be dynamically added here by WebRTC logic */}
-                                                {/* Each remote video will have style={{ aspectRatio: '16/9' }} applied */}
-                                            </div>
-
-                                            {/* Empty Slots for Visual Balance */}
-                                            {Array.from({
-                                                length: Math.max(0, (cols * rows) - totalVideos)
-                                            }).map((_, index) => (
-                                                <motion.div
-                                                    key={`empty-${index}`}
-                                                    initial={{ opacity: 0 }}
-                                                    animate={{ opacity: 1 }}
-                                                    transition={{ delay: 0.3 + index * 0.1 }}
-                                                    className="relative group w-full"
-                                                    style={{ aspectRatio: '16/9' }}
-                                                >
-                                                    <div className="w-full h-full bg-gray-800/20 border-2 border-dashed border-gray-600/30 rounded-xl flex items-center justify-center">
-                                                        <div className="text-center">
-                                                            <div className="w-8 h-8 bg-gray-600/30 rounded-full flex items-center justify-center mx-auto mb-2">
-                                                                <Users className="w-4 h-4 text-gray-500" />
-                                                            </div>
-                                                            <p className="text-xs text-gray-500">Waiting...</p>
-                                                        </div>
-                                                    </div>
-                                                </motion.div>
-                                            ))}
-                                        </motion.div>
-                                    );
-                                })()}
-                            </div>
-                        </div>
-
-                        {/* Bottom Controls */}
-                        <motion.div
-                            initial={{ opacity: 0, y: 50 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            transition={{ delay: 0.4 }}
-                            className="p-4 bg-gradient-to-t from-black/80 to-transparent"
-                        >
-                            <div className="max-w-4xl mx-auto">
-                                <div className="flex items-center justify-center space-x-4">
-                                    {/* Camera Toggle */}
-                                    <motion.button
-                                        whileHover={{ scale: 1.05 }}
-                                        whileTap={{ scale: 0.95 }}
-                                        onClick={toggleCamera}
-                                        className={cn(
-                                            "w-12 h-12 rounded-full flex items-center justify-center transition-all cursor-target z-100",
-                                            isCameraEnabled
-                                                ? "bg-gray-700/50 hover:bg-gray-600/50 text-white"
-                                                : "bg-red-500/20 hover:bg-red-500/30 text-red-400"
-                                        )}
-                                    >
-                                        {isCameraEnabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
-                                    </motion.button>
-
-                                    {/* Microphone Toggle */}
-                                    <motion.button
-                                        whileHover={{ scale: 1.05 }}
-                                        whileTap={{ scale: 0.95 }}
-                                        onClick={toggleMicrophone}
-                                        className={cn(
-                                            "w-12 h-12 rounded-full flex items-center justify-center transition-all cursor-target z-100",
-                                            isMicrophoneEnabled
-                                                ? "bg-gray-700/50 hover:bg-gray-600/50 text-white"
-                                                : "bg-red-500/20 hover:bg-red-500/30 text-red-400"
-                                        )}
-                                    >
-                                        {isMicrophoneEnabled ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
-                                    </motion.button>
-
-                                    {/* Settings */}
-                                    <motion.button
-                                        whileHover={{ scale: 1.05 }}
-                                        whileTap={{ scale: 0.95 }}
-                                        onClick={() => setShowSettings(true)}
-                                        className="w-12 h-12 rounded-full flex items-center justify-center bg-gray-700/50 hover:bg-gray-600/50 text-white transition-all cursor-target z-100"
-                                    >
-                                        <Settings className="w-5 h-5" />
-                                    </motion.button>
-
-                                    {/* Participants */}
-                                    <motion.button
-                                        whileHover={{ scale: 1.05 }}
-                                        whileTap={{ scale: 0.95 }}
-                                        onClick={() => setShowParticipants(!showParticipants)}
-                                        className="w-12 h-12 rounded-full flex items-center justify-center bg-gray-700/50 hover:bg-gray-600/50 text-white transition-all cursor-target relative z-100"
-                                    >
-                                        <Users className="w-5 h-5" />
-                                        <Badge className="absolute -top-2 -right-2 bg-lime-500 text-white text-xs min-w-[20px] h-5">
-                                            {participants.length}
-                                        </Badge>
-                                    </motion.button>
-
-                                    {/* AI Translate Sidebar */}
-                                    <motion.button
-                                        whileHover={{ scale: 1.05 }}
-                                        whileTap={{ scale: 0.95 }}
-                                        onClick={() => setShowAITranslate(!showAITranslate)}
-                                        className={cn(
-                                            "w-12 h-12 rounded-full flex items-center justify-center transition-all cursor-target z-100 relative",
-                                            showAITranslate
-                                                ? "bg-purple-600/30 text-purple-300 border-2 border-purple-500/50"
-                                                : "bg-gray-700/50 hover:bg-gray-600/50 text-white"
-                                        )}
-                                    >
-                                        <Languages className="w-5 h-5" />
-                                        {speechLogs.length > 0 && (
-                                            <Badge className="absolute -top-2 -right-2 bg-purple-500 text-white text-xs min-w-[20px] h-5">
-                                                {speechLogs.length}
-                                            </Badge>
-                                        )}
-                                    </motion.button>
-
-                                    {/* Leave Room */}
-                                    <motion.button
-                                        whileHover={{ scale: 1.05 }}
-                                        whileTap={{ scale: 0.95 }}
-                                        onClick={handleLeaveRoom}
-                                        className="w-12 h-12 rounded-full flex items-center justify-center bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-all cursor-target z-100"
-                                    >
-                                        <PhoneOff className="w-5 h-5" />
-                                    </motion.button>
-                                </div>
-
-                                {/* Room Info */}
-                                <motion.div
-                                    initial={{ opacity: 0 }}
-                                    animate={{ opacity: 1 }}
-                                    transition={{ delay: 0.6 }}
-                                    className="mt-4 text-center"
-                                >
-                                    <div className="flex items-center justify-center space-x-6 text-sm text-gray-400">
-                                        <div className="flex items-center space-x-2">
-                                            <Shield className="w-4 h-4" />
-                                            <span>End-to-End Encrypted</span>
-                                        </div>
-                                        <div className="flex items-center space-x-2">
-                                            <Globe className="w-4 h-4" />
-                                            <span>P2P Network</span>
-                                        </div>
-                                        <div className="flex items-center space-x-2">
-                                            <Activity className="w-4 h-4" />
-                                            <span>Real-time</span>
-                                        </div>
-                                    </div>
-                                </motion.div>
-                            </div>
-                        </motion.div>
-                    </motion.div>
-                )}
-            </main>
-
-            {/* Participants Sidebar */}
-            <AnimatePresence>
-                {showParticipants && (
-                    <motion.div
-                        initial={{ opacity: 0, x: 300 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        exit={{ opacity: 0, x: 300 }}
-                        className="fixed top-16 right-0 bottom-0 w-80 bg-gray-900/90 backdrop-blur-md border-l border-gray-700/50 z-50"
-                    >
-                        <div className="p-6 h-full flex flex-col">
-                            <div className="flex items-center justify-between mb-6">
-                                <h3 className="text-lg font-semibold text-white">Participants</h3>
-                                <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    onClick={() => setShowParticipants(false)}
-                                    className="text-gray-400 hover:text-white cursor-target"
-                                >
-                                    <EyeOff className="w-4 h-4" />
-                                </Button>
-                            </div>
-
-                            <div className="space-y-3 flex-1 overflow-y-auto">
-                                {/* Current User */}
-                                <div className="flex items-center space-x-3 p-3 bg-green-500/10 rounded-lg border border-green-500/20 cursor-target">
-                                    <div className="w-10 h-10 bg-green-400/20 rounded-full flex items-center justify-center">
-                                        <User className="w-5 h-5 text-green-400" />
-                                    </div>
-                                    <div className="flex-1">
-                                        <p className="text-sm font-medium text-white">
-                                            {String(user?.name || '').trim() || String(user?.username || '').trim()} (You)
-                                        </p>
-                                        <p className="text-xs text-green-300">{isHost ? 'Host' : 'Participant'}</p>
-                                    </div>
-                                    <Badge className="bg-green-500/20 text-green-300 border-green-500/30">
-                                        Online
-                                    </Badge>
-                                </div>
-
-                                {/* Other Participants */}
-                                {participants
-                                    .filter(participant => participant !== principalId)
-                                    .map((participant, index) => (
-                                        <motion.div
-                                            key={participant}
-                                            initial={{ opacity: 0, y: 20 }}
-                                            animate={{ opacity: 1, y: 0 }}
-                                            transition={{ delay: index * 0.1 }}
-                                            className="flex items-center space-x-3 p-3 bg-gray-800/50 rounded-lg border border-gray-600/50 cursor-target"
-                                        >
-                                            <div className="w-10 h-10 bg-blue-400/20 rounded-full flex items-center justify-center">
-                                                <User className="w-5 h-5 text-blue-400" />
-                                            </div>
-                                            <div className="flex-1">
-                                                <p className="text-sm font-medium text-white">
-                                                    {`User #${index + 1}`}
-                                                </p>
-                                                <p className="text-xs text-gray-400">
-                                                    {participant.length > 20
-                                                        ? `${participant.substring(0, 20)}...`
-                                                        : participant
-                                                    }
-                                                </p>
-                                            </div>
-                                            <Badge className="bg-blue-500/20 text-blue-300 border-blue-500/30">
-                                                Connected
-                                            </Badge>
-                                        </motion.div>
-                                    ))
-                                }
-
-                                {/* Empty State when no other participants */}
-                                {participants.filter(participant => participant !== principalId).length === 0 && (
-                                    <motion.div
-                                        initial={{ opacity: 0 }}
-                                        animate={{ opacity: 1 }}
-                                        className="text-center py-8"
-                                    >
-                                        <div className="w-16 h-16 bg-gray-600/20 rounded-full flex items-center justify-center mx-auto mb-4">
-                                            <Users className="w-8 h-8 text-gray-500" />
-                                        </div>
-                                        <p className="text-gray-400 text-sm mb-2">No other participants yet</p>
-                                        <p className="text-gray-500 text-xs">Share the room id to invite others</p>
-                                    </motion.div>
-                                )}
-                            </div>
-
-                            <div className="pt-4 border-t border-gray-700/50">
-                                <div className="space-y-3">
-                                    {/* Room Info */}
-                                    <div className="bg-gray-800/30 rounded-lg p-3">
-                                        <div className="flex items-center justify-between text-xs text-gray-400 mb-2">
-                                            <span>Room ID</span>
-                                            <span className="font-mono">{roomId}</span>
-                                        </div>
-                                        <div className="flex items-center justify-between text-xs text-gray-400">
-                                            <span>Total Participants</span>
-                                            <span>{participants.length}</span>
-                                        </div>
-                                    </div>
-
-                                    {/* Invite Button */}
-                                    <Button
-                                        onClick={copyRoomLink}
-                                        className="w-full bg-lime-600 hover:bg-lime-700 cursor-target"
-                                    >
-                                        <Copy className="w-4 h-4 mr-2" />
-                                        Invite Others
-                                    </Button>
-                                </div>
-                            </div>
-                        </div>
-                    </motion.div>
-                )}
-            </AnimatePresence>
-
-            {/* AI Translation Sidebar */}
-            <AnimatePresence>
-                {showAITranslate && (
-                    <motion.div
-                        initial={{ opacity: 0, x: -300 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        exit={{ opacity: 0, x: -300 }}
-                        className="fixed top-16 left-0 bottom-0 w-96 bg-gray-900/90 backdrop-blur-md border-r border-gray-700/50 z-50"
-                    >
-                        <div className="p-6 h-full flex flex-col">
-                            {/* Header */}
-                            <div className="flex items-center justify-between mb-6">
-                                <div className="flex items-center space-x-3">
-                                    <Languages className="w-5 h-5 text-purple-400" />
-                                    <h3 className="text-lg font-semibold text-white">AI Translation</h3>
-                                </div>
-                                <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    onClick={() => setShowAITranslate(false)}
-                                    className="text-gray-400 hover:text-white cursor-target"
-                                >
-                                    ✕
-                                </Button>
-                            </div>
-
-                            {/* Controls */}
-                            <div className="space-y-4 mb-6">
-                                {/* Source Language Selection */}
-                                <div>
-                                    <label className="block text-sm font-medium mb-2 text-white">
-                                        From (Source Language)
-                                    </label>
-                                    <select
-                                        value={sourceLanguage}
-                                        onChange={(e) => {
-                                            setSourceLanguage(e.target.value);
-                                            // Restart speech recognition with new language if active
-                                            if (recognitionActive) {
-                                                stopAITranscription();
-                                                setTimeout(() => {
-                                                    startAITranscription();
-                                                }, 500);
-                                            }
-                                        }}
-                                        className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-3 py-2 text-white cursor-target scrollbar-hidden"
-                                    >
-                                        {supportedLanguages.map(lang => (
-                                            <option key={lang} value={lang}>
-                                                {getLanguageName(lang)}
-                                            </option>
-                                        ))}
-                                    </select>
-                                </div>
-
-                                {/* Target Language Selection */}
-                                <div>
-                                    <label className="block text-sm font-medium mb-2 text-white">
-                                        To (Target Language)
-                                    </label>
-                                    <select
-                                        value={targetLanguage}
-                                        onChange={(e) => setTargetLanguage(e.target.value)}
-                                        className="w-full bg-gray-700/50 border border-gray-600 rounded-lg px-3 py-2 text-white cursor-target scrollbar-hidden"
-                                    >
-                                        {supportedLanguages.map(lang => (
-                                            <option key={lang} value={lang}>
-                                                {getLanguageName(lang)}
-                                            </option>
-                                        ))}
-                                    </select>
-                                </div>
-
-                                {/* Transcription Controls */}
-                                <div className="flex items-center space-x-3">
-                                    <Button
-                                        onClick={startAITranscription}
-                                        disabled={isTranscribing}
-                                        size="sm"
-                                        className={cn(
-                                            "flex-1",
-                                            isTranscribing
-                                                ? "bg-green-600/50 cursor-not-allowed"
-                                                : "bg-green-600 hover:bg-green-700"
-                                        )}
-                                    >
-                                        <Play className="w-4 h-4 mr-2" />
-                                        {isTranscribing ? 'Listening...' : 'Start Listening'}
-                                    </Button>
-
-                                    <Button
-                                        onClick={stopAITranscription}
-                                        disabled={!isTranscribing}
-                                        size="sm"
-                                        variant="destructive"
-                                        className="disabled:opacity-50"
-                                    >
-                                        <Pause className="w-4 h-4" />
-                                    </Button>
-
-                                    <Button
-                                        onClick={clearSpeechLogs}
-                                        size="sm"
-                                        variant="outline"
-                                        className="border-gray-600 hover:bg-gray-700"
-                                    >
-                                        <Trash className='w-4 h-4' />
-                                    </Button>
-                                </div>
-                            </div>
-
-                            {/* Translate Logs */}
-                            <div className="flex-1 overflow-hidden">
-                                <div className="flex items-center justify-between mb-3">
-                                    <h4 className="text-sm font-medium text-white">Translate Logs</h4>
-                                    {translationLoading && (
-                                        <div className="flex items-center space-x-2 text-purple-400">
-                                            <div className="w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
-                                            <span className="text-xs">Translating...</span>
-                                        </div>
-                                    )}
-                                </div>
-
-                                <div className="space-y-3 overflow-y-auto h-full scrollbar-hidden">
-                                    {speechLogs.length === 0 ? (
-                                        <div className="text-center py-8">
-                                            <MessageSquare className="w-12 h-12 text-gray-500 mx-auto mb-3" />
-                                            <p className="text-gray-400 text-sm">No speech detected yet</p>
-                                            <p className="text-gray-500 text-xs mt-1">Start listening to see translations</p>
-                                        </div>
-                                    ) : (
-                                        speechLogs.map((log) => (
-                                            <motion.div
-                                                key={log.id}
-                                                initial={{ opacity: 0, y: 20 }}
-                                                animate={{ opacity: 1, y: 0 }}
-                                                className={cn(
-                                                    "p-3 rounded-lg border-l-4",
-                                                    log.isLocal
-                                                        ? "bg-green-500/10 border-green-400"
-                                                        : "bg-blue-500/10 border-blue-400"
-                                                )}
-                                            >
-                                                {/* Header */}
-                                                <div className="flex items-center justify-between mb-2">
-                                                    <div className="flex items-center space-x-2">
-                                                        <div className={`w-6 h-6 rounded-full flex items-center justify-center ${log.isLocal ? 'bg-green-400/20' : 'bg-blue-400/20'
-                                                            }`}>
-                                                            {log.isLocal ? (
-                                                                <Mic2 className={`w-3 h-3 ${log.isLocal ? 'text-green-400' : 'text-blue-400'}`} />
-                                                            ) : (
-                                                                <Volume2 className={`w-3 h-3 ${log.isLocal ? 'text-green-400' : 'text-blue-400'}`} />
-                                                            )}
-                                                        </div>
-                                                        <span className="text-xs font-medium text-white">
-                                                            {log.participantName}
-                                                        </span>
-                                                    </div>
-                                                    <span className="text-xs text-gray-400">
-                                                        {log.timestamp.toLocaleTimeString()}
-                                                    </span>
-                                                </div>
-
-                                                {/* Original Text */}
-                                                <div className="mb-2">
-                                                    <div className="flex items-center space-x-2 mb-1">
-                                                        <span className="text-xs text-gray-400">From:</span>
-                                                        <Badge variant="outline" className="text-xs font-mono">
-                                                            {log.participantId.length > 12
-                                                                ? `${log.participantId.substring(0, 12)}...`
-                                                                : log.participantId
-                                                            }
-                                                        </Badge>
-                                                    </div>
-                                                    <p className="text-sm text-white">{log.originalText}</p>
-                                                </div>
-
-                                                {/* Translation */}
-                                                <div>
-                                                    <div className="flex items-center space-x-2 mb-1">
-                                                        <span className="text-xs text-gray-400">Translation:</span>
-                                                        <Badge variant="outline" className="text-xs text-purple-400">
-                                                            {getLanguageName(targetLanguage)}
-                                                        </Badge>
-                                                    </div>
-
-                                                    {log.isTranslating ? (
-                                                        <div className="flex items-center space-x-2 text-purple-400">
-                                                            <div className="w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
-                                                            <span className="text-sm">Translating...</span>
-                                                        </div>
-                                                    ) : (
-                                                        <p className="text-sm text-purple-300 bg-purple-500/10 rounded p-2">
-                                                            {log.translatedText}
-                                                        </p>
-                                                    )}
-                                                </div>
-                                            </motion.div>
-                                        ))
-                                    )}
-                                </div>
-                            </div>
-
-                            {/* Footer Info */}
-                            <div className="pt-4 border-t border-gray-700/50">
-                                <div className="text-xs text-gray-400 space-y-1">
-                                    <div className="flex items-center justify-between">
-                                        <span>AI Translation</span>
-                                        <span className="text-purple-400">LLaMA 3.1</span>
-                                    </div>
-                                    <div className="flex items-center justify-between">
-                                        <span>Total Logs</span>
-                                        <span>{speechLogs.length}</span>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </motion.div>
-                )}
-            </AnimatePresence>
-
-            {/* Settings Modal */}
-            <AnimatePresence>
-                {showSettings && (
-                    <motion.div
+                        key="gate"
+                        className="absolute inset-0 z-[90] bg-black overflow-hidden"
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
                         exit={{ opacity: 0 }}
-                        className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 backdrop-blur-md"
-                        onClick={() => setShowSettings(false)}
+                        transition={{ duration: 0.25 }}
+                        role="dialog"
+                        aria-modal="true"
+                    >
+                        {/* BACKGROUND: animated grid + lime fog + floating pixels */}
+                        <div className="absolute inset-0 bg-black">
+                            <div className="lobby-anim-grid absolute inset-0 opacity-[0.22]" aria-hidden />
+                            <motion.div
+                                aria-hidden
+                                className="pointer-events-none absolute -top-24 -left-20 w-[46rem] h-[46rem] rounded-full blur-3xl"
+                                style={{ background: "radial-gradient(closest-side, rgba(163,230,53,0.16), transparent 70%)" }}
+                                initial={{ opacity: 0, scale: 0.92 }}
+                                animate={{ opacity: 1, scale: 1 }}
+                                transition={{ duration: 0.8, delay: 0.1 }}
+                            />
+                            <motion.div
+                                aria-hidden
+                                className="pointer-events-none absolute -bottom-28 -right-24 w-[38rem] h-[38rem] rounded-full blur-3xl"
+                                style={{ background: "radial-gradient(closest-side, rgba(163,230,53,0.12), transparent 70%)" }}
+                                initial={{ opacity: 0, scale: 1.06 }}
+                                animate={{ opacity: 1, scale: 1 }}
+                                transition={{ duration: 0.9, delay: 0.2 }}
+                            />
+
+                            {/* Floating pixel objects */}
+                            {[
+                                { left: "9%", top: "18%", size: 12, delay: 0.2 },
+                                { left: "22%", top: "70%", size: 10, delay: 0.6 },
+                                { left: "48%", top: "14%", size: 14, delay: 0.1 },
+                                { left: "68%", top: "64%", size: 12, delay: 0.4 },
+                                { left: "82%", top: "28%", size: 10, delay: 0.9 },
+                                { left: "35%", top: "48%", size: 8, delay: 0.5 },
+                                { left: "56%", top: "82%", size: 9, delay: 0.7 },
+                                { left: "76%", top: "12%", size: 11, delay: 0.35 },
+                            ].map((f, i) => (
+                                <motion.div
+                                    key={i}
+                                    aria-hidden
+                                    className="absolute"
+                                    style={{ left: f.left, top: f.top, width: f.size, height: f.size, imageRendering: "pixelated" }}
+                                    initial={{ y: 0, opacity: 0.7 }}
+                                    animate={{ y: [0, -10, 0], opacity: [0.7, 1, 0.7] }}
+                                    transition={{ duration: 4.5, repeat: Infinity, delay: f.delay, ease: "easeInOut" }}
+                                >
+                                    <div className="w-full h-full rounded-[2px] bg-lime-300/50 border border-lime-400/60 shadow-[0_0_12px_rgba(163,230,53,0.25)]" />
+                                </motion.div>
+                            ))}
+                        </div>
+
+                        {/* CONTENT */}
+                        <div className="relative h-full w-full flex flex-col">
+                            {/* Top bar */}
+                            <motion.header
+                                initial={{ y: -8, opacity: 0 }}
+                                animate={{ y: 0, opacity: 1 }}
+                                transition={{ duration: 0.35, delay: 0.05 }}
+                                className="px-6 md:px-8 pt-5 flex items-center gap-4"
+                            >
+                                <div className="flex-1 min-w-0 text-center md:text-left">
+                                    <div className="text-[11px] tracking-[0.2em] uppercase text-white">Welcome to</div>
+                                    <div className="text-white text-2xl sm:text-3xl md:text-4xl tracking-tight">
+                                        <span className="font-logo text-lime-400">{String(roomId || "-").toUpperCase()}</span>
+                                    </div>
+                                </div>
+
+                                <div className="hidden md:flex items-center gap-3 text-right">
+                                    <div className="text-xs text-slate-300">
+                                        Player:&nbsp;
+                                        <span className="font-semibold text-white">
+                                            {(user?.name || user?.username) ? (user?.name || user?.username) : "Anonymous"}
+                                        </span>
+                                    </div>
+                                </div>
+                            </motion.header>
+
+                            {/* HERO */}
+                            <div className="flex-1 grid place-items-center px-6 md:px-8 pb-8">
+                                <motion.div
+                                    initial={{ opacity: 0, y: 10, scale: 0.99 }}
+                                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                                    exit={{ opacity: 0, y: 10, scale: 0.99 }}
+                                    transition={{ type: "spring", stiffness: 240, damping: 22 }}
+                                    className="mx-auto w-full max-w-[960px] flex items-center justify-center gap-8 md:gap-12"
+                                >
+                                    {/* LEFT: preview card */}
+                                    <motion.div
+                                        initial={{ opacity: 0, x: -8 }}
+                                        animate={{ opacity: 1, x: 0 }}
+                                        transition={{ delay: 0.08, duration: 0.28 }}
+                                        className="relative shrink-0 rounded-2xl overflow-hidden border border-lime-400/30
+                                                   shadow-[0_0_0_1px_rgba(163,230,53,0.25),0_0_60px_rgba(163,230,53,0.08)]
+                                                   bg-gradient-to-b from-lime-400/10 via-slate-900/60 to-slate-900/80
+                                                   w-[220px] h-[220px] grid place-items-center"
+                                    >
+                                        <canvas
+                                            ref={prePreviewRef}
+                                            width={220}
+                                            height={220}
+                                            className="block w-[220px] h-[220px]"
+                                            style={{ imageRendering: "pixelated" }}
+                                        />
+                                    </motion.div>
+
+                                    {/* RIGHT: Join */}
+                                    <motion.div
+                                        initial={{ opacity: 0, x: 8 }}
+                                        animate={{ opacity: 1, x: 0 }}
+                                        transition={{ delay: 0.12, duration: 0.30 }}
+                                        className="flex-1 min-w-[260px] max-w-[560px]"
+                                    >
+                                        <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full border border-lime-400/30
+                                                        bg-lime-400/10 text-lime-300 text-[11px] font-semibold tracking-wide uppercase">
+                                            Ready to join
+                                        </div>
+
+                                        <h2 className="mt-3 text-white text-2xl sm:text-3xl font-bold">
+                                            Step in and meet others
+                                        </h2>
+                                        <p className="mt-2 text-slate-300 text-sm sm:text-base max-w-[64ch]">
+                                            Move around, chat, and explore. Hit the button to enter the room.
+                                        </p>
+
+                                        {preJoinError && (
+                                            <motion.div
+                                                initial={{ opacity: 0, y: 6 }}
+                                                animate={{ opacity: 1, y: 0 }}
+                                                className="mt-3 mb-2 text-sm rounded-lg border border-rose-500/40 bg-rose-900/30 text-rose-200 px-3 py-2"
+                                            >
+                                                {preJoinError}
+                                            </motion.div>
+                                        )}
+
+                                        <div className="mt-5 flex flex-col sm:flex-row sm:items-center gap-3">
+                                            <motion.button
+                                                type="button"
+                                                onClick={() => { handlePreJoin(); }}
+                                                whileHover={{ scale: 1.02 }}
+                                                whileTap={{ scale: 0.98 }}
+                                                className="inline-flex items-center justify-center px-5 py-3 rounded-xl
+                                                           bg-lime-400 text-black font-semibold border border-lime-300 shadow
+                                                           hover:bg-lime-300 transition w-full sm:w-auto"
+                                                title="Join room"
+                                            >
+                                                Join room
+                                            </motion.button>
+
+                                            <div className="text-[11px] text-slate-400">
+                                                You can adjust settings later inside the room.
+                                            </div>
+                                        </div>
+                                    </motion.div>
+                                </motion.div>
+                            </div>
+                        </div>
+
+                        <style>
+                            {`
+                            .lobby-anim-grid{
+                                --c1: rgba(255,255,255,0.05);
+                                --c2: rgba(163,230,53,0.10);
+                                background-image:
+                                linear-gradient(var(--c1) 1px, transparent 1px),
+                                linear-gradient(90deg, var(--c1) 1px, transparent 1px),
+                                radial-gradient(circle at 20% 20%, var(--c2), transparent 35%),
+                                radial-gradient(circle at 80% 60%, rgba(163,230,53,0.08), transparent 40%);
+                                background-size:
+                                40px 40px,
+                                40px 40px,
+                                100% 100%,
+                                100% 100%;
+                                animation: lobbyGridMove 18s linear infinite;
+                            }
+                            @keyframes lobbyGridMove {
+                                0% { background-position: 0 0, 0 0, 0 0, 0 0; }
+                                50% { background-position: 40px 20px, 20px 40px, 1% 1%, -1% -1%; }
+                                100% { background-position: 80px 40px, 40px 80px, 0 0, 0 0; }
+                            }
+
+                            .lobby-grid{
+                                display: grid;
+                                grid-template-columns: minmax(420px, 720px) 1fr;
+                                gap: 2rem;
+                                align-items: center;
+                                justify-items: center;
+                            }
+
+                            @media (orientation: portrait), (max-width: 760px){
+                                .lobby-grid{
+                                grid-template-columns: 1fr;
+                                gap: 1.5rem;
+                                }
+                            }
+
+                            .text-panel{ padding: 0.5rem 0.25rem; }
+                            `}
+                        </style>
+                    </motion.div>
+                </AnimatePresence>
+            )}
+
+            {/* unified loading overlay */}
+            <AnimatePresence>
+                {showLoader && (
+                    <motion.div
+                        key="loader"
+                        className="absolute inset-0 bg-black grid place-items-center z-[60]"
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        transition={{ duration: 0.2 }}
                     >
                         <motion.div
-                            initial={{ opacity: 0, scale: 0.8, y: 50 }}
-                            animate={{ opacity: 1, scale: 1, y: 0 }}
-                            exit={{ opacity: 0, scale: 0.8, y: 50 }}
-                            onClick={(e) => e.stopPropagation()}
-                            className="bg-gradient-to-br from-gray-900/95 to-gray-800/95 backdrop-blur-xl rounded-3xl w-full max-w-lg mx-4 border border-gray-600/30 shadow-2xl overflow-hidden"
+                            initial={{ opacity: 0, scale: 0.92 }}
+                            animate={{ opacity: 1, scale: 1 }}
+                            transition={{ type: "spring", stiffness: 220, damping: 22 }}
+                            className="text-center"
                         >
-                            {/* Header with Gradient */}
-                            <div className="relative bg-gradient-to-r from-lime-500/10 to-purple-500/10 p-6 border-b border-gray-700/50">
-                                <div className="absolute inset-0 bg-gradient-to-r from-lime-400/5 to-purple-400/5" />
-                                <div className="relative flex items-center justify-between">
-                                    <div className="flex items-center space-x-3">
-                                        <div className="w-10 h-10 bg-gradient-to-br from-lime-400/20 to-purple-400/20 rounded-xl flex items-center justify-center border border-lime-400/20">
-                                            <Settings className="w-5 h-5 text-lime-400" />
-                                        </div>
-                                        <div>
-                                            <h3 className="text-xl font-bold text-white">Settings</h3>
-                                            <p className="text-sm text-gray-400">Configure your media devices</p>
-                                        </div>
-                                    </div>
-                                    <Button
-                                        variant="ghost"
-                                        size="sm"
-                                        onClick={() => setShowSettings(false)}
-                                        className="text-gray-400 hover:text-white hover:bg-gray-700/50 rounded-xl cursor-target transition-all"
+                            <div className="text-white text-xl">Connecting to room...</div>
+                            <div className="text-gray-400 text-sm mt-2">{subtext}</div>
+                            <div className="mt-4 w-64 mx-auto">
+                                <div className="text-gray-400 text-xs mb-1 text-right tabular-nums">{uiPct}%</div>
+
+                                <div className="h-1.5 w-full bg-white/10 rounded overflow-hidden">
+                                    <motion.div
+                                        className="h-full rounded relative"
+                                        style={{ width: widthPct, backgroundColor: "rgb(132 204 22)" }}
                                     >
-                                        ✕
-                                    </Button>
-                                </div>
-                            </div>
-
-                            {/* Content */}
-                            <div className="p-6 space-y-6">
-                                {/* Camera Section */}
-                                <motion.div
-                                    initial={{ opacity: 0, y: 20 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    transition={{ delay: 0.1 }}
-                                    className="space-y-3"
-                                >
-                                    <div className="flex items-center space-x-3 mb-3">
-                                        <div className="w-8 h-8 bg-blue-500/20 rounded-lg flex items-center justify-center">
-                                            <Video className="w-4 h-4 text-blue-400" />
-                                        </div>
-                                        <div>
-                                            <label className="text-sm font-semibold text-white">Camera Device</label>
-                                            <p className="text-xs text-gray-400">Select your preferred camera</p>
-                                        </div>
-                                    </div>
-
-                                    <div className="relative">
-                                        <select
-                                            value={selectedCameraId}
-                                            onChange={(e) => handleCameraChange(e.target.value)}
-                                            className="w-full bg-gray-800/50 border border-gray-600/50 rounded-xl px-4 py-3 text-white cursor-target focus:outline-none focus:ring-2 focus:ring-lime-400/50 focus:border-lime-400/50 transition-all appearance-none pr-10"
-                                        >
-                                            <option value="">Default Camera</option>
-                                            {availableDevices.cameras.map((device, index) => (
-                                                <option key={device.deviceId} value={device.deviceId}>
-                                                    {device.label || `Camera ${index + 1}`}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <ChevronDown className="absolute right-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
-                                    </div>
-
-                                    {/* Camera Status */}
-                                    <div className="flex items-center justify-between p-3 bg-gray-800/30 rounded-lg border border-gray-700/30">
-                                        <div className="flex items-center space-x-2">
-                                            <div className={`w-2 h-2 rounded-full ${isCameraEnabled ? 'bg-green-400 animate-pulse' : 'bg-gray-500'}`} />
-                                            <span className="text-sm text-gray-300">
-                                                Camera: {isCameraEnabled ? 'Enabled' : 'Disabled'}
-                                            </span>
-                                        </div>
-                                        <Badge variant="outline" className="text-xs text-blue-400 border-blue-500/30">
-                                            {availableDevices.cameras.length} available
-                                        </Badge>
-                                    </div>
-                                </motion.div>
-
-                                {/* Microphone Section */}
-                                <motion.div
-                                    initial={{ opacity: 0, y: 20 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    transition={{ delay: 0.2 }}
-                                    className="space-y-3"
-                                >
-                                    <div className="flex items-center space-x-3 mb-3">
-                                        <div className="w-8 h-8 bg-green-500/20 rounded-lg flex items-center justify-center">
-                                            <Mic className="w-4 h-4 text-green-400" />
-                                        </div>
-                                        <div>
-                                            <label className="text-sm font-semibold text-white">Microphone Device</label>
-                                            <p className="text-xs text-gray-400">Select your preferred microphone</p>
-                                        </div>
-                                    </div>
-
-                                    <div className="relative">
-                                        <select
-                                            value={selectedMicrophoneId}
-                                            onChange={(e) => handleMicrophoneChange(e.target.value)}
-                                            className="w-full bg-gray-800/50 border border-gray-600/50 rounded-xl px-4 py-3 text-white cursor-target focus:outline-none focus:ring-2 focus:ring-lime-400/50 focus:border-lime-400/50 transition-all appearance-none pr-10"
-                                        >
-                                            <option value="">Default Microphone</option>
-                                            {availableDevices.microphones.map((device, index) => (
-                                                <option key={device.deviceId} value={device.deviceId}>
-                                                    {device.label || `Microphone ${index + 1}`}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <ChevronDown className="absolute right-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
-                                    </div>
-
-                                    {/* Microphone Status */}
-                                    <div className="flex items-center justify-between p-3 bg-gray-800/30 rounded-lg border border-gray-700/30">
-                                        <div className="flex items-center space-x-2">
-                                            <div className={`w-2 h-2 rounded-full ${isMicrophoneEnabled ? 'bg-green-400 animate-pulse' : 'bg-gray-500'}`} />
-                                            <span className="text-sm text-gray-300">
-                                                Microphone: {isMicrophoneEnabled ? 'Enabled' : 'Disabled'}
-                                            </span>
-                                        </div>
-                                        <Badge variant="outline" className="text-xs text-green-400 border-green-500/30">
-                                            {availableDevices.microphones.length} available
-                                        </Badge>
-                                    </div>
-                                </motion.div>
-                            </div>
-
-                            {/* Footer Actions */}
-                            <div className="p-6 bg-gray-800/30 border-t border-gray-700/50">
-                                <div className="space-y-4">
-                                    {/* Refresh Devices Button */}
-                                    <motion.button
-                                        whileHover={{ scale: 1.02 }}
-                                        whileTap={{ scale: 0.98 }}
-                                        onClick={enumerateDevices}
-                                        disabled={isDevicesLoading}
-                                        className="w-full bg-gradient-to-r from-lime-500/90 to-green-500/90 hover:from-lime-600 hover:to-green-600 disabled:opacity-50 disabled:cursor-not-allowed text-white py-3 px-4 rounded-xl font-semibold transition-all cursor-target flex items-center justify-center space-x-2 shadow-lg"
-                                    >
-                                        {isDevicesLoading ? (
-                                            <>
-                                                <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent" />
-                                                <span>Refreshing Devices...</span>
-                                            </>
-                                        ) : (
-                                            <>
-                                                <Camera className="w-4 h-4" />
-                                                <span>Refresh All Devices</span>
-                                            </>
-                                        )}
-                                    </motion.button>
-
-                                    {/* Quick Actions */}
-                                    <div className="grid grid-cols-2 gap-3">
-                                        <Button
-                                            onClick={() => {
-                                                toggleCamera();
-                                                setShowSettings(false);
-                                            }}
-                                            variant="outline"
-                                            className="border-gray-600 hover:bg-gray-700/50 text-white cursor-target"
-                                        >
-                                            <Video className="w-4 h-4 mr-2" />
-                                            {isCameraEnabled ? 'Turn Off Camera' : 'Turn On Camera'}
-                                        </Button>
-                                        <Button
-                                            onClick={() => {
-                                                toggleMicrophone();
-                                                setShowSettings(false);
-                                            }}
-                                            variant="outline"
-                                            className="border-gray-600 hover:bg-gray-700/50 text-white cursor-target"
-                                        >
-                                            <Mic className="w-4 h-4 mr-2" />
-                                            {isMicrophoneEnabled ? 'Mute Mic' : 'Unmute Mic'}
-                                        </Button>
-                                    </div>
-
-                                    {/* Device Statistics */}
-                                    <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700/30">
-                                        <h4 className="text-sm font-medium text-white mb-3 flex items-center">
-                                            <Activity className="w-4 h-4 mr-2 text-lime-400" />
-                                            Device Status
-                                        </h4>
-                                        <div className="grid grid-cols-2 gap-4 text-xs">
-                                            <div>
-                                                <div className="flex items-center justify-between mb-1">
-                                                    <span className="text-gray-400">Cameras Found</span>
-                                                    <span className="text-blue-400 font-medium">{availableDevices.cameras.length}</span>
-                                                </div>
-                                                <div className="w-full bg-gray-700 rounded-full h-1.5">
-                                                    <div
-                                                        className="bg-blue-400 h-1.5 rounded-full transition-all"
-                                                        style={{ width: `${Math.min(availableDevices.cameras.length * 25, 100)}%` }}
-                                                    />
-                                                </div>
-                                            </div>
-                                            <div>
-                                                <div className="flex items-center justify-between mb-1">
-                                                    <span className="text-gray-400">Microphones Found</span>
-                                                    <span className="text-green-400 font-medium">{availableDevices.microphones.length}</span>
-                                                </div>
-                                                <div className="w-full bg-gray-700 rounded-full h-1.5">
-                                                    <div
-                                                        className="bg-green-400 h-1.5 rounded-full transition-all"
-                                                        style={{ width: `${Math.min(availableDevices.microphones.length * 25, 100)}%` }}
-                                                    />
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
+                                        <div className="absolute inset-0 opacity-60 loader-stripes" style={{ mixBlendMode: "overlay" }} />
+                                    </motion.div>
                                 </div>
                             </div>
                         </motion.div>
+
+                        <style>
+                            {`
+                            .loader-stripes{
+                                --band: 8px;
+                                --period: calc(var(--band) * 2);
+                                --loop-x: calc(var(--period) * 1.41421356);
+
+                                background-image:
+                                repeating-linear-gradient(
+                                    45deg,
+                                    rgba(255,255,255,0.35) 0 var(--band),
+                                    rgba(255,255,255,0.05) var(--band) var(--period)
+                                );
+                                background-repeat: repeat;
+                                animation: loader-stripe-slide-x 0.9s linear infinite;
+                                will-change: background-position;
+                                transform: translateZ(0);
+                            }
+
+                            @keyframes loader-stripe-slide-x {
+                                from { background-position: 0 0; }
+                                to   { background-position: var(--loop-x) 0; }
+                            }
+                            `}
+                        </style>
                     </motion.div>
                 )}
             </AnimatePresence>
 
-            {/* Background Effects */}
-            <div className="fixed inset-0 pointer-events-none z-0">
-                <motion.div
-                    className="absolute top-1/4 left-1/4 w-72 h-72 bg-lime-600/10 rounded-full blur-3xl"
-                    animate={{
-                        scale: [1, 1.2, 1],
-                        opacity: [0.3, 0.5, 0.3],
-                    }}
-                    transition={{
-                        duration: 8,
-                        repeat: Infinity,
-                        ease: "easeInOut"
-                    }}
-                />
-                <motion.div
-                    className="absolute bottom-1/4 right-1/4 w-72 h-72 bg-purple-600/10 rounded-full blur-3xl"
-                    animate={{
-                        scale: [1.2, 1, 1.2],
-                        opacity: [0.5, 0.3, 0.5],
-                    }}
-                    transition={{
-                        duration: 6,
-                        repeat: Infinity,
-                        ease: "easeInOut",
-                        delay: 2
-                    }}
-                />
-                <motion.div
-                    className="absolute top-3/4 left-1/2 w-72 h-72 bg-green-600/10 rounded-full blur-3xl"
-                    animate={{
-                        scale: [1, 1.3, 1],
-                        opacity: [0.4, 0.6, 0.4],
-                    }}
-                    transition={{
-                        duration: 10,
-                        repeat: Infinity,
-                        ease: "easeInOut",
-                        delay: 4
-                    }}
-                />
+            <PixelReveal
+                play={showPixelReveal}
+                durationMs={2000}
+                cols={28}
+                zIndex={80}
+                onComplete={() => setShowPixelReveal(false)}
+            />
+
+            <canvas
+                ref={canvasRef}
+                className="absolute inset-0 w-full h-full block"
+                style={{
+                    imageRendering: "pixelated",
+                    opacity: showLoader ? 0 : 1,
+                    transition: "opacity 120ms ease"
+                }}
+                onContextMenu={(e) => e.preventDefault()}
+            />
+
+            {/* Chat panel */}            
+            <div
+                ref={chatPanelRef}
+                style={{
+                    position: "absolute",
+                    top: 0, left: 0, height: "100%", width: 320,
+                    background: "rgba(2,6,23,0.92)", borderRight: "1px solid rgba(148,163,184,0.25)",
+                    color: "#e5e7eb", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                    transform: `translateX(${showChat ? 0 : -330}px)`,
+                    transition: "transform 220ms ease",
+                    display: "flex", flexDirection: "column", zIndex: 50,
+                    backdropFilter: "blur(6px)",
+                }}
+                aria-hidden={!showChat}
+            >
+                <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(163,230,53,0.3)", background: "rgba(21,128,61,0.05)" }}>
+                    <div style={{ fontWeight: 700 }}>Chat</div>
+                    <div style={{ fontSize: 11, color: "#94a3b8" }}>{roomId || "-"}</div>
+                </div>
+
+                <div ref={chatListRef} style={{ flex: 1, overflowY: "auto", padding: "10px 12px" }}>
+                    {chatLog.length === 0 ? (
+                        <div style={{ color: "#94a3b8" }}>No messages yet...</div>
+                    ) : (
+                        chatLog.map((m) => (
+                            <div key={m.id} style={{ fontSize: 13, marginBottom: 8, wordBreak: "break-word" }}>
+                                <span style={{ color: "#94a3b8", fontSize: 11, marginRight: 8 }}>
+                                    {new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                </span>
+                                <span style={{ fontWeight: 700, color: m.self ? "#a3e635" : "#e5e7eb" }}>
+                                    {m.self ? "You" : (m.label || pretty(m.fromPeerId))}
+                                </span>
+                                <span style={{ color: "#94a3b8", margin: "0 6px" }}>:</span>
+                                <span style={{ whiteSpace: "pre-wrap" }}>{m.text}</span>
+                            </div>
+                        ))
+                    )}
+                </div>
+
+                <div style={{ padding: 10, borderTop: "1px solid rgba(148,163,184,0.25)" }}>
+                    <div style={{ display: "flex", gap: 8 }}>
+                        <input
+                            id="chat-input-box"
+                            ref={chatInputRef}
+                            value={chatInput}
+                            onFocus={() => { typingChatRef.current = true; }}
+                            onBlur={() => { typingChatRef.current = false; }}
+                            onChange={(e) => setChatInput(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(chatInput); } }}
+                            placeholder="Type a message..."
+                            style={{
+                                flex: 1,
+                                padding: "8px 10px",
+                                borderRadius: 8,
+                                border: "1px solid rgba(148,163,184,0.35)",
+                                background: "rgba(15,23,42,0.6)",
+                                color: "#e5e7eb",
+                                outline: "none",
+                            }}
+                        />
+                        <button
+                            onClick={() => sendChat(chatInput)}
+                            disabled={!chatInput.trim()}
+                            style={{
+                                padding: "8px 12px",
+                                borderRadius: 8,
+                                background: chatInput.trim() ? "rgb(132,204,22)" : "rgba(148,163,184,0.25)",
+                                color: chatInput.trim() ? "#0b1b06" : "#cbd5e1",
+                                border: "1px solid rgba(132,204,22,0.5)",
+                                cursor: chatInput.trim() ? "pointer" : "not-allowed",
+                            }}
+                        >
+                            Send
+                        </button>
+                    </div>
+                    <div style={{ marginTop: 6, fontSize: 11, color: "#94a3b8" }}>
+                        Enter to send - Shift+Enter for newline - Press C to toggle chat
+                    </div>
+                </div>
             </div>
+
+            {/* Bottom center controls */}
+            <div
+                data-no-dismiss
+                className="absolute left-1/2 -translate-x-1/2 bottom-6 z-[45] flex items-center gap-2"
+            >
+                {/* Chat */}
+                <IconButton
+                    title="Toggle chat (C)"
+                    onClick={() => setShowChat(v => !v)}
+                    active={showChat}
+                    badge={chatLog.length}
+                    badgeSrOnly={`${chatLog.length} messages`}
+                >
+                    <IconChat className="w-5 h-5" />
+                </IconButton>
+
+                {/* Mic */}
+                <MicSplitButton
+                    active={micOn}
+                    danger={!micOn}
+                    onToggle={onToggleMic}
+                    onToggleSettings={() => setShowMicSettings(v => !v)}
+                    expanded={showMicSettings}
+                />
+
+                {/* Participants */}
+                <IconButton
+                    title="Participants"
+                    onClick={() => setShowSidebar(v => !v)}
+                    active={showSidebar}
+                    badge={participantsReady.length}
+                    badgeSrOnly={`${participantsReady.length} participants`}
+                >
+                    <IconUsers className="w-5 h-5" />
+                </IconButton>
+
+                <div className="w-px h-6 bg-white/20 mx-1" />
+
+                {/* Outfit */}
+                <IconButton
+                    title="Customize outfit"
+                    onClick={openOutfit}
+                    active={showOutfit}
+                >
+                    <IconOutfit className="w-5 h-5" />
+                </IconButton>
+
+                <div className="w-px h-6 bg-white/20 mx-1" />
+
+                {/* Leave */}
+                <IconButton
+                    title="Leave room"
+                    onClick={async () => { await gracefulLeave(); navigate("/dashboard", { replace: true }); }}
+                    danger
+                >
+                    <IconLeave className="w-5 h-5" />
+                </IconButton>
+            </div>
+
+            {/* Zoom controls */}
+            <div
+                data-no-dismiss
+                className="absolute bottom-6 right-6 z-[46] flex flex-col gap-2"
+            >
+                <IconButton title="Zoom in (+)" onClick={requestZoomIn} aria-label="Zoom in">
+                    <IconZoomIn className="w-5 h-5" />
+                </IconButton>
+                <IconButton title="Zoom out (-)" onClick={requestZoomOut} aria-label="Zoom out">
+                    <IconZoomOut className="w-5 h-5" />
+                </IconButton>
+            </div>
+
+            {/* Mobile joystick */}
+            {useJoystick && !showChat && !showOutfit && <MobileJoystick />}
+
+            {/* Mic settings popover */}
+            <AnimatePresence>
+                {showMicSettings && (
+                    <motion.div
+                        ref={micPanelRef}
+                        initial={{ opacity: 0, y: 16 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: 16 }}
+                        transition={{ type: "spring", stiffness: 260, damping: 20 }}
+                        className="absolute left-1/2 -translate-x-1/2 bottom-28 z-[70] w-[min(92vw,620px)] rounded-2xl border border-white/15 bg-slate-900/90 backdrop-blur-xl p-0 shadow-2xl overflow-hidden"
+                    >
+                        {/* header */}
+                        <div className="px-4 py-3 bg-gradient-to-r from-lime-900/20 to-transparent border-b border-white/10 flex items-center justify-between">
+                            <div className="flex items-center gap-2 text-white">
+                                <IconMicOn className="w-4 h-4 text-lime-300" />
+                                <span className="font-medium">Microphone</span>
+                            </div>
+                            <button
+                                onClick={() => setShowMicSettings(false)}
+                                className="text-slate-300 hover:text-white text-sm"
+                            >
+                                Close
+                            </button>
+                        </div>
+
+                        {/* body */}
+                        <div className="p-4">
+                            <div className="flex flex-col md:flex-row md:items-center gap-3">
+                                <select
+                                    className="flex-1 px-3 py-2 rounded-lg border border-white/15 bg-slate-800/70 text-slate-100
+                                               focus:outline-none focus:ring-2 focus:ring-lime-400/40 focus:border-lime-400/40"
+                                    value={selectedMicId}
+                                    onChange={(e) => setSelectedMicId(e.target.value)}
+                                    title="Select microphone device"
+                                >
+                                    {mics.length === 0 ? (
+                                        <option value="">(no devices)</option>
+                                    ) : (
+                                        mics.map((d) => (
+                                            <option key={d.deviceId} value={d.deviceId}>
+                                                {(d.label || "Microphone")}{d.deviceId === "default" ? " [default]" : ""}
+                                            </option>
+                                        ))
+                                    )}
+                                </select>
+
+                                <button
+                                    onClick={async () => { await onApplyMic(); setShowMicSettings(false); }}
+                                    className="px-4 py-2 rounded-lg bg-lime-600 hover:bg-lime-500 text-white"
+                                >
+                                    Apply
+                                </button>
+                            </div>
+
+                            {/* meter */}
+                            <div className="mt-4">
+                                <div className="text-xs text-slate-400 mb-1">Input level</div>
+                                <div className="h-2 w-full rounded-full bg-white/10 overflow-hidden">
+                                    <div
+                                        className="h-full bg-gradient-to-r from-lime-500 to-lime-400 transition-[width] duration-75"
+                                        style={{ width: `${Math.min(100, Math.round((micLevel || 0) * 180))}%` }}
+                                    />
+                                </div>
+                                <div className="mt-2 text-xs text-slate-400">
+                                    Status: {micOn ? "Mic ON (sending to peers you can hear)" : "Mic OFF"}
+                                </div>
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            {/* Right sidebar (participants) */}
+            <div
+                ref={rightSidebarRef}
+                className={`absolute top-0 right-0 h-full w-[340px] bg-slate-900/95 backdrop-blur border-l border-slate-700 text-white transition-transform duration-300 ease-out z-[70] ${showSidebar ? "translate-x-0" : "translate-x-full"}`}
+            >
+                <div className="flex flex-col h-full">
+                    {/* header */}
+                    <div className="px-4 py-3 border-b border-white/10 bg-gradient-to-l from-slate-800/50 to-transparent flex items-center justify-between">
+                        <div className="min-w-0">
+                            <div className="font-semibold">Room</div>
+                            <div className="text-xs text-slate-400 truncate max-w-[200px]">{roomId || "-"}</div>
+                        </div>
+                        <button
+                            onClick={onInviteClick}
+                            disabled={inviteCopied}
+                            className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm ${inviteCopied
+                                ? "bg-emerald-700 text-white"
+                                : "bg-lime-600 hover:bg-lime-500 text-white"
+                                }`}
+                            title={inviteCopied ? "Link copied" : "Copy this room link"}
+                        >
+                            <IconCopy className="w-4 h-4" />
+                            {inviteCopied ? "Copied" : "Invite"}
+                        </button>
+                    </div>
+
+                    {/* body */}
+                    <div className="flex-1 overflow-y-auto p-4">
+                        <div className="flex items-center justify-between mb-2">
+                            <div className="font-medium">Participants</div>
+                            <div className="text-xs text-slate-400">{participantsReady.length}</div>
+                        </div>
+
+                        {participantsReady.length === 0 ? (
+                            <div className="text-slate-400 text-sm">No connected participants</div>
+                        ) : (
+                            <ul className="space-y-2">
+                                {participantsReady.map((p) => (
+                                    <ParticipantRow key={p} pid={p} />
+                                ))}
+                            </ul>
+                        )}
+                    </div>
+
+                    {/* footer */}
+                    <div className="p-4 border-t border-slate-700/60">
+                        <button
+                            data-no-dismiss
+                            onClick={() => setShowMicSettings(true)}
+                            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-gray-700/50 hover:bg-gray-600/50 text-white transition"
+                            title="Open microphone settings"
+                        >
+                            <IconSettings className="w-4 h-4" />
+                            Mic settings
+                        </button>
+                    </div>
+
+                </div>
+            </div>
+
+            {/* Outfit Editor Modal */}
+            <AnimatePresence>
+                {showOutfit && (
+                    <>
+                        {/* Backdrop */}
+                        <motion.div
+                            key="outfit-backdrop"
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            exit={{ opacity: 0 }}
+                            transition={{ duration: 0.18 }}
+                            className="fixed inset-0 z-[65] bg-black/40 backdrop-blur-sm"
+                            onClick={() => closeOutfit(false)}
+                            aria-hidden
+                        />
+
+                        {/* Modal */}
+                        <div className="fixed inset-0 z-[70] grid place-items-center pb-28 md:pb-32 pointer-events-none">
+                            <motion.div
+                                key="outfit-modal"
+                                initial={{ opacity: 0, y: 16 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, y: 16 }}
+                                transition={{ type: "spring", stiffness: 260, damping: 20 }}
+                                role="dialog"
+                                aria-modal="true"
+                                className="pointer-events-auto w-[min(96vw,900px)] rounded-xl border border-slate-700 bg-slate-900/95 backdrop-blur p-4 shadow-2xl"
+                            >
+                                {/* header */}
+                                <div className="flex items-center justify-between mb-3">
+                                    <div className="text-white font-medium">Outfit</div>
+                                    <button
+                                        onClick={() => closeOutfit(false)}
+                                        className="text-slate-300 hover:text-white text-sm"
+                                    >
+                                        Close
+                                    </button>
+                                </div>
+
+                                {/* 3-pane layout */}
+                                <div className="grid grid-cols-1 md:grid-cols-[180px_1fr_220px] gap-4">
+
+                                    {/* left: slot menu */}
+                                    <div className="rounded-lg border border-slate-700/70 overflow-hidden">
+                                        <div className="bg-slate-800/60 px-3 py-2 text-xs text-slate-300">Slots</div>
+                                        <div className="max-h-[300px] overflow-y-auto p-1">
+                                            {OUTFIT_SLOT_ORDER.map((slot) => {
+                                                const active = activeSlot === slot;
+                                                return (
+                                                    <button
+                                                        key={slot}
+                                                        onClick={() => setActiveSlot(slot)}
+                                                        className={`w-full text-left px-3 py-2 rounded-md mb-1 capitalize transition
+                                                            ${active
+                                                                ? "bg-lime-400/20 text-lime-200 border border-lime-400/30"
+                                                                : "text-slate-200 hover:bg-slate-700/40"
+                                                            }`}
+                                                    >
+                                                        {slot.replace(/_/g, " ")}
+                                                    </button>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+
+                                    {/* middle: option grid */}
+                                    <div className="rounded-lg border border-slate-700/70 p-3 min-h-[240px]">
+                                        <div className="flex items-center justify-between mb-2">
+                                            <div className="text-slate-200 font-medium capitalize">
+                                                {activeSlot.replace(/_/g, " ")}
+                                            </div>
+                                            <div className="text-xs text-slate-400">
+                                                {(OUTFIT_OPTIONS[activeSlot as keyof typeof OUTFIT_OPTIONS] || []).length} items
+                                            </div>
+                                        </div>
+
+                                        {(() => {
+                                            const slotKey = activeSlot as keyof typeof OUTFIT_OPTIONS;
+                                            const slotIdx = OUTFIT_SLOT_ORDER.indexOf(activeSlot as any);
+                                            const items = OUTFIT_OPTIONS[slotKey] || [];
+                                            if (slotIdx < 0) return (
+                                                <div className="text-slate-400 text-sm">Slot not recognized.</div>
+                                            );
+
+                                            return (
+                                                <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-5 gap-2">
+                                                    {items.map((opt) => {
+                                                        const selected = mySlots[slotIdx] === opt.id;
+                                                        return (
+                                                            <button
+                                                                key={opt.id}
+                                                                onClick={() => {
+                                                                    const next = mySlots.slice() as OutfitSlotsArray;
+                                                                    next[slotIdx] = opt.id;
+                                                                    setMySlots(next);
+                                                                }}
+                                                                title={opt.label}
+                                                                className={`group relative aspect-square rounded-lg border text-left transition
+                                                                            ${selected
+                                                                        ? "border-lime-400 ring-2 ring-lime-400/60"
+                                                                        : "border-slate-700 hover:border-slate-500"}
+                                                                            bg-slate-800/60`}
+                                                            >
+                                                                {/* label */}
+                                                                <div className="absolute inset-0 grid place-items-center px-2 text-center">
+                                                                    <div className={`text-[12px] leading-tight ${selected ? "text-lime-200" : "text-slate-200"}`}>
+                                                                        {opt.label}
+                                                                    </div>
+                                                                </div>
+                                                                {/* selected tick */}
+                                                                {selected && (
+                                                                    <div className="absolute top-1 right-1 text-[10px] px-1.5 py-0.5 rounded bg-lime-500 text-white">
+                                                                        selected
+                                                                    </div>
+                                                                )}
+                                                            </button>
+                                                        );
+                                                    })}
+                                                </div>
+                                            );
+                                        })()}
+                                    </div>
+
+                                    {/* right: preview */}
+                                    <div className="rounded-lg border border-slate-700/70 p-3">
+                                        <div className="text-slate-200 font-medium mb-2">Preview</div>
+                                        <div
+                                            className="rounded-md border border-slate-700 bg-slate-800/60 grid place-items-center"
+                                            style={{ width: 180, height: 180 }}
+                                        >
+                                            <canvas ref={previewRef} style={{ imageRendering: "pixelated" }} />
+                                        </div>
+
+                                        <div className="mt-3 flex flex-wrap gap-2">
+                                            <button
+                                                onClick={() => setMySlots(DEFAULT_OUTFIT)}
+                                                className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-white text-sm"
+                                            >
+                                                Reset to default
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* footer actions */}
+                                <div className="mt-4 flex items-center justify-end gap-2">
+                                    <button
+                                        onClick={onCancelOutfit}
+                                        className="px-4 py-2 rounded bg-slate-700 hover:bg-slate-600 text-white"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        onClick={onApplyOutfit}
+                                        className="px-4 py-2 rounded bg-lime-600 hover:bg-lime-500 text-white"
+                                    >
+                                        Apply
+                                    </button>
+                                </div>
+
+                                <div className="mt-2 text-xs text-slate-400">
+                                    Pick a slot on the left - click an item box to change it. Press Apply to save.
+                                </div>
+                            </motion.div>
+                        </div>
+                    </>
+                )}
+            </AnimatePresence>
         </div>
     );
 };

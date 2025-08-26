@@ -16,7 +16,7 @@ import {
 } from 'lucide-react';
 import TargetCursor from '../components/target-cursor';
 import { useAuth } from '../contexts/AuthContext';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 
 // Animation variants 
 const fadeInUpVariants = {
@@ -35,8 +35,21 @@ const smoothTransition = {
     ease: "easeOut" as const,
 };
 
+// Result helpers that work with both {ok,err} and {Ok,Err}
+const isErr = (r: any) => r && (('err' in r) || ('Err' in r));
+const getErr = <E,>(r: any): E => ('Err' in r ? r.Err : r.err);
+
+// Error helpers
+const extractErrorText = (e: unknown) =>
+    typeof e === 'string' ? e : (e && typeof e === 'object' && 'message' in e ? String((e as any).message) : JSON.stringify(e));
+
+const isUsernameTakenError = (e: unknown) =>
+    extractErrorText(e).toUpperCase().includes('USERNAME_TAKEN');
+
 const Profile: React.FC = () => {
     const navigate = useNavigate();
+    const location = useLocation();
+    const [nextPath, setNextPath] = useState<string>("");
 
     const {
         isAuthenticated,
@@ -53,6 +66,21 @@ const Profile: React.FC = () => {
         error: authError
     } = useAuth();
 
+    useEffect(() => {
+        const qs = new URLSearchParams(location.search);
+        const fromQS = qs.get("next") || "";
+        const fromStore = sessionStorage.getItem("next") || "";
+        const n = fromQS || fromStore;
+        if (n) setNextPath(n.startsWith("/") ? n : `/${n}`);
+    }, [location.search]);
+
+    useEffect(() => {
+        if (isAuthenticated && !authLoading && user?.username && nextPath) {
+            sessionStorage.removeItem("next");
+            navigate(nextPath, { replace: true });
+        }
+    }, [isAuthenticated, authLoading, user?.username, nextPath, navigate]);
+
     // Form states
     const [username, setUsername] = useState('');
     const [displayName, setDisplayName] = useState('');
@@ -64,6 +92,11 @@ const Profile: React.FC = () => {
     const [loading, setLoading] = useState(false);
     const [userExists, setUserExists] = useState<boolean | null>(null);
     const [updateSuccess, setUpdateSuccess] = useState(false);
+
+    // Validation states
+    const [usernameError, setUsernameError] = useState<string | null>(null);
+    const USERNAME_REGEX = /^[a-z0-9]{3,20}$/;
+    const normalizeUsername = (v: string) => v.trim().toLowerCase();
 
     // Setup steps
     const setupSteps = [
@@ -111,20 +144,51 @@ const Profile: React.FC = () => {
     };
 
     const handleCreateProfile = async () => {
-        if (username.length < 3) {
-            alert('Username must be at least 3 characters');
+        const normalized = normalizeUsername(username);
+
+        if (!USERNAME_REGEX.test(normalized)) {
+            setUsernameError("Use 3–20 lowercase letters or digits (a-z, 0-9), no spaces.");
             return;
         }
 
         setLoading(true);
+        setUsernameError(null);
+
         try {
-            const result = await authenticateUser(username);
-            if ('Err' in result) {
-                alert(`Error: ${result.Err}`);
-            } else {
-                setUserExists(true);
-                await refreshUser();
+            const result = await authenticateUser(normalized);
+
+            if (isErr(result)) {
+                const errText = extractErrorText(getErr<string>(result));
+                if (isUsernameTakenError(errText)) {
+                    setUsernameError(`Username "${normalized}" is already taken.`);
+                    return;
+                }
+                alert(`Error: ${errText}`);
+                return;
             }
+
+            const postRegisterUpdate: any = {
+                username: [],
+                name: [normalized],
+                profilePicture: [],
+                outfitSlots: []
+            };
+
+            const upd = await updateProfile(postRegisterUpdate);
+            if (isErr(upd)) {
+                const errText = extractErrorText(getErr<string>(upd));
+                console.error('Post-register name update failed:', errText);
+            } else {
+                setDisplayName(normalized);
+            }
+
+            setUserExists(true);
+            await refreshUser();
+
+            const target = nextPath || "/dashboard";
+            sessionStorage.removeItem("next");
+            navigate(target, { replace: true });
+
         } catch (error) {
             console.error('Auth error:', error);
             alert('Authentication failed');
@@ -135,27 +199,50 @@ const Profile: React.FC = () => {
 
     const handleUpdateProfile = async () => {
         setLoading(true);
+        setUsernameError(null);
+
         try {
-            // Safe string handling with type checks
-            const safeUsername = typeof username === 'string' ? username.trim() : '';
+            const safeUsername = typeof username === 'string' ? normalizeUsername(username) : '';
             const safeDisplayName = typeof displayName === 'string' ? displayName.trim() : '';
             const safeProfilePicture = typeof profilePicture === 'string' ? profilePicture.trim() : '';
+
+            const usernameChanged = !!safeUsername && safeUsername !== (user?.username ?? '');
+            if (usernameChanged && !USERNAME_REGEX.test(safeUsername)) {
+                setUsernameError("Use 3-20 lowercase letters or digits (a-z, 0-9), no spaces.");
+                setIsEditing(true);
+                return;
+            }
 
             const updateData: any = {
                 username: safeUsername !== '' ? [safeUsername] : [],
                 name: safeDisplayName !== '' ? [safeDisplayName] : [],
-                profilePicture: safeProfilePicture !== '' ? [safeProfilePicture] : []
+                profilePicture: safeProfilePicture !== '' ? [safeProfilePicture] : [],
+                outfitSlots: []
             };
 
             const result = await updateProfile(updateData);
-            if ('Err' in result) {
-                alert(`Error: ${result.Err}`);
-            } else {
-                setUpdateSuccess(true);
-                setIsEditing(false);
-                await refreshUser();
-                setTimeout(() => setUpdateSuccess(false), 3000);
+
+            if (isErr(result)) {
+                const errText = extractErrorText(getErr<string>(result));
+                if (isUsernameTakenError(errText)) {
+                    setUsernameError(`Username "${safeUsername}" is already taken.`);
+                    setIsEditing(true);
+                    return;
+                }
+                alert(`Error: ${errText}`);
+                setIsEditing(true);
+                return;
             }
+
+            setUpdateSuccess(true);
+            setIsEditing(false);
+            await refreshUser();
+            if (nextPath) {
+                sessionStorage.removeItem("next");
+                navigate(nextPath, { replace: true });
+            }
+            setTimeout(() => setUpdateSuccess(false), 3000);
+
         } catch (error) {
             console.error('Update error:', error);
             alert('Profile update failed: ' + (error instanceof Error ? error.message : 'Unknown error'));
@@ -624,11 +711,20 @@ const Profile: React.FC = () => {
                                                     <Input
                                                         type="text"
                                                         value={username}
-                                                        onChange={(e) => setUsername(e.target.value.toLowerCase())}
+                                                        onChange={(e) => {
+                                                            setUsername(normalizeUsername(e.target.value));
+                                                            if (usernameError) setUsernameError(null);
+                                                        }}
                                                         placeholder="Enter your username"
-                                                        className="mt-2 bg-gray-800/50 border-gray-600 text-white cursor-target lowercase"
+                                                        className={cn(
+                                                            "mt-2 bg-gray-800/50 border-gray-600 text-white cursor-target lowercase",
+                                                            usernameError && "border-red-500 focus-visible:ring-red-500"
+                                                        )}
                                                         maxLength={20}
                                                     />
+                                                    {usernameError && (
+                                                        <p className="text-xs text-red-400 mt-1">{usernameError}</p>
+                                                    )}
                                                     <p className="text-xs text-gray-400 mt-1">
                                                         3-20 characters, letters and numbers only
                                                     </p>
@@ -636,7 +732,7 @@ const Profile: React.FC = () => {
 
                                                 <Button
                                                     onClick={handleCreateProfile}
-                                                    disabled={loading || username.length < 3}
+                                                    disabled={loading || username.length < 3 || !!usernameError}
                                                     className="w-full bg-yellow-400 text-black hover:bg-yellow-500 cursor-target"
                                                     size="lg"
                                                 >
@@ -701,12 +797,21 @@ const Profile: React.FC = () => {
                                                             <Input
                                                                 type="text"
                                                                 value={username}
-                                                                onChange={(e) => setUsername(e.target.value)}
-                                                                className="mt-2 bg-gray-800/50 border-gray-600 text-white cursor-target"
+                                                                onChange={(e) => {
+                                                                    setUsername(normalizeUsername(e.target.value));
+                                                                    if (usernameError) setUsernameError(null);
+                                                                }}
+                                                                className={cn(
+                                                                    "mt-2 bg-gray-800/50 border-gray-600 text-white cursor-target",
+                                                                    usernameError && "border-red-500 focus-visible:ring-red-500"
+                                                                )}
                                                                 maxLength={20}
                                                             />
                                                         ) : (
                                                             <div className="mt-2 text-white font-medium">{user.username}</div>
+                                                        )}
+                                                        {isEditing && usernameError && (
+                                                            <p className="text-xs text-red-400 mt-1">{usernameError}</p>
                                                         )}
                                                     </div>
 

@@ -2,7 +2,20 @@
   "canisters": {
     "backend": {
       "main": "src/backend/main.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "dependencies": [
+        "online_users"
+      ]
+    },
+    "online_users": {
+      "main": "src/online_users/main.mo",
+      "type": "motoko",
+      "metadata": [
+        {
+          "name": "candid:service",
+          "visibility": "private"
+        }
+      ]
     },
     "translation": {
       "main": "src/translation/main.mo",

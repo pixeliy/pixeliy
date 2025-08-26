@@ -10,6 +10,8 @@ export interface BackendActor {
     updateUserProfile(updateData: UserUpdateData): Promise<Result<User, string>>;
     getUserByUsername(username: string): Promise<User | null>;
     getUserByPrincipal(userId: Principal): Promise<User | null>;
+    setMyOutfit(outfitSlots: string[]): Promise<Result<User, string>>;
+    getUserOutfit(userId: Principal): Promise<string[]>;
 
     // Room functions
     createRoom(roomId: string): Promise<Result<Room, string>>;
@@ -28,6 +30,11 @@ export interface BackendActor {
     debugSignals(roomId: string): Promise<Signal[]>;
     // resetAllRooms(): Promise<void>;
     // resetAllSignals(): Promise<void>;
+
+    // Online users functions
+    registerOnline(): Promise<void>;
+    getOnlineUsers(): Promise<Principal[]>;
+    getTotalOnlineUsers(): Promise<number>;
 }
 
 class CanisterService {
@@ -73,12 +80,6 @@ class CanisterService {
         await this.init(identity);
     }
 
-    // private getHost(): string {
-    //     return this.isDevelopment() 
-    //         ? 'http://localhost:4943' 
-    //         : 'https://ic0.app';
-    // }
-
     private getHost(): string {
         // Check DFX_NETWORK first, then fallback to other indicators
         const dfxNetwork = process.env.DFX_NETWORK;
@@ -123,10 +124,6 @@ class CanisterService {
         // Check if hostname matches pattern: canister-id.localhost
         return window.location.hostname.endsWith('.localhost');
     }
-
-    // private isDevelopment(): boolean {
-    //     return process.env.NODE_ENV === 'development';
-    // }
 
     private ensureActor(): ActorSubclass<BackendActor> {
         if (!this.actor) {
@@ -182,21 +179,29 @@ class CanisterService {
         }
     }
 
+    async setMyOutfit(outfitSlots: string[]): Promise<Result<User, string>> {
+        const actor = this.ensureActor();
+        const raw = await actor.setMyOutfit(outfitSlots);
+        return this.normalizeResult<User>(raw) as Result<User, string>;
+    }
+
+    async getUserOutfit(userId: Principal): Promise<string[]> {
+        const actor = this.ensureActor();
+        return await actor.getUserOutfit(userId);
+    }
+
     // ROOM METHODS
     async createRoom(roomId: string): Promise<Result<Room, string>> {
         const actor = this.ensureActor();
-        return await actor.createRoom(roomId);
+        const raw = await actor.createRoom(roomId);
+        return this.normalizeResult<Room>(raw) as Result<Room, string>;
     }
 
     async joinRoom(roomId: string): Promise<Result<Room, string>> {
         const actor = this.ensureActor();
-        return await actor.joinRoom(roomId);
+        const raw = await actor.joinRoom(roomId);
+        return this.normalizeResult<Room>(raw) as Result<Room, string>;
     }
-
-    // async getRoom(roomId: string): Promise<Room | null> {
-    //     const actor = this.ensureActor();
-    //     return await actor.getRoom(roomId);
-    // }
 
     async getRoom(roomId: string): Promise<Room | null> {
         const actor = this.ensureActor();
@@ -262,7 +267,8 @@ class CanisterService {
 
     async leaveRoom(roomId: string): Promise<Result<Room, string>> {
         const actor = this.ensureActor();
-        return await actor.leaveRoom(roomId);
+        const raw = await actor.leaveRoom(roomId);
+        return this.normalizeResult<Room>(raw) as Result<Room, string>;
     }
 
     // SIGNAL METHODS
@@ -290,6 +296,36 @@ class CanisterService {
     async debugSignals(roomId: string): Promise<Signal[]> {
         const actor = this.ensureActor();
         return await actor.debugSignals(roomId);
+    }
+
+    private normalizeResult<T>(raw: any): { Ok?: T; Err?: string } {
+        if (!raw || typeof raw !== "object") return { Err: "Invalid canister response" };
+
+        // success
+        if ("Ok" in raw) return { Ok: raw.Ok as T };
+        if ("ok" in raw) return { Ok: raw.ok as T };
+
+        // error
+        if ("Err" in raw) return { Err: String(raw.Err) };
+        if ("err" in raw) return { Err: String(raw.err) };
+
+        return { Err: "Unknown result shape" };
+    }
+
+    // ONLINE METHODS
+    async registerOnline(): Promise<void> {
+        const actor = this.ensureActor();
+        return await actor.registerOnline();
+    }
+
+    async getOnlineUsers(): Promise<Principal[]> {
+        const actor = this.ensureActor();
+        return await actor.getOnlineUsers();
+    }
+
+    async getTotalOnlineUsers(): Promise<number> {
+        const actor = this.ensureActor();
+        return await actor.getTotalOnlineUsers();
     }
 }
 

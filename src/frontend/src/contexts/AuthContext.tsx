@@ -10,6 +10,7 @@ interface AuthContextType {
     principalId: string;
     isLoading: boolean;
     error: string | null;
+    identity: import('@dfinity/agent').Identity | null;
     login: () => Promise<boolean>;
     logout: () => Promise<void>;
     authenticateUser: (username: string) => Promise<Result<User, string>>;
@@ -299,6 +300,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         principalId,
         isLoading,
         error,
+        identity: authClient ? authClient.getIdentity() : null,
         login,
         logout,
         authenticateUser,
