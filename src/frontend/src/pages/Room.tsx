@@ -77,6 +77,7 @@ const Room: React.FC = () => {
     } = useAuth();
 
     const {
+        // joinRoom,
         leaveRoom,
         getRoom,
         sendSignal,
@@ -1694,6 +1695,30 @@ const Room: React.FC = () => {
         };
     }, [showAITranslate, isUserReady]);
 
+    // useEffect(() => {
+    //     if (roomId && isAuthenticated && user?.username && !roomData) {
+    //         const autoJoinRoom = async () => {
+    //             setLoading(true);
+    //             try {
+    //                 const room = await getRoom(roomId);
+    //                 if (!room) {
+    //                     alert(`Room "${roomId}" does not exist`);
+    //                     setLoading(false);
+    //                     return;
+    //                 }
+    //                 const result = await joinRoom(roomId);
+    //                 if ('Err' in result) {
+    //                     alert(`Failed to join room: ${result.Err}`);
+    //                 }
+    //             } catch (error) {
+    //                 alert('Failed to join room');
+    //             } finally {
+    //                 setLoading(false);
+    //             }
+    //         };
+    //         autoJoinRoom();
+    //     }
+    // }, [roomId, isAuthenticated, user, roomData]);
 
     // ========== RENDER CONDITIONS ==========
     if (authLoading || loading || roomLoading) {
