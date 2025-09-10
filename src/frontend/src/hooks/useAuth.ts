@@ -104,7 +104,7 @@ export const useAuth = (): UseAuthReturn => {
                 if (dfxNetwork === 'local') {
                     identityProvider = `http://${internetIdentityCanisterId}.localhost:4943`;
                 } else {
-                    identityProvider = 'https://identity.ic0.app';
+                    identityProvider = 'https://id.ai';
                 }
 
                 client.login({

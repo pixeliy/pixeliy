@@ -189,7 +189,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
                         identityProvider = `http://localhost:4943/?canisterId=${internetIdentityCanisterId}`;
                     }
                 } else {
-                    identityProvider = 'https://identity.ic0.app';
+                    identityProvider = 'https://id.ai';
                 }
 
                 client.login({
