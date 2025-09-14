@@ -67,6 +67,10 @@ actor {
     await OnlineUsers.registerOnline(message.caller);
   };
 
+  public shared (message) func unregisterOnline() : async () {
+    await OnlineUsers.unregisterOnline(message.caller);
+  };
+
   public func getTotalOnlineUsers() : async Nat {
     let allStatuses = await OnlineUsers.status();
     var count : Nat = 0;

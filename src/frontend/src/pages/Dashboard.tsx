@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { InteractiveGridPattern } from '@/components/ui/interactive-grid';
 import { Badge } from '@/components/ui/badge';
@@ -16,8 +16,11 @@ import {
 import TargetCursor from '../components/target-cursor';
 import SpotlightCard from '../components/spotlight-card';
 import { useAuth } from '../contexts/AuthContext';
+import { usePeers } from '../contexts/PeersContext';
 import { useRoom } from '../hooks/useRoom';
 import { useNavigate } from 'react-router-dom';
+import { canisterService } from '../services/canisterService';
+import { Principal } from '@dfinity/principal';
 import LoginRequired from '../components/auth/LoginRequired';
 import ProfileSetupRequired from '../components/auth/ProfileSetupRequired';
 
@@ -80,10 +83,49 @@ const Dashboard: React.FC = () => {
         error: roomError
     } = useRoom();
 
+    const {
+        isPeerReady,
+        statusText,
+        activeCount,
+        messages,
+        sendChat,
+    } = usePeers();
+
     const [roomId, setRoomId] = useState('');
     const [loading, setLoading] = useState(false);
     const [showCreateForm, setShowCreateForm] = useState(false);
     const [showJoinForm, setShowJoinForm] = useState(false);
+
+    const [chatInput, setChatInput] = useState('');
+    const [displayActive, setDisplayActive] = useState<number>(activeCount || 0);
+    const [nameMap, setNameMap] = useState<Record<string, string>>({});
+    const displayActiveRef = useRef<number>(activeCount || 0);
+    const didInitActiveRef = useRef<boolean>(false);
+    const chatListRef = useRef<HTMLDivElement | null>(null);
+
+    const selfDisplayName = React.useMemo(
+        () => (String(user?.name || '').trim() || String(user?.username || '').trim() || 'You'),
+        [user]
+    );
+
+    const uniqueFromIds = React.useMemo(
+        () => Array.from(new Set(messages.map(m => m.from))).filter(Boolean),
+        [messages]
+    );
+
+    const unresolvedIds = React.useMemo(
+        () => uniqueFromIds.filter(id => !(id in nameMap)),
+        [uniqueFromIds, nameMap]
+    );
+
+    const visibleMessages = React.useMemo(
+        () => messages.filter(m => m.self || Boolean(nameMap[m.from])),
+        [messages, nameMap]
+    );
+
+    const allNamesReady = messages.length === 0 || (
+        Boolean(selfDisplayName) && unresolvedIds.length === 0
+    );
 
     // Dummy data for featured hubs
     const featuredHubs = [
@@ -331,6 +373,91 @@ const Dashboard: React.FC = () => {
             refreshUser();
         }
     }, [isAuthenticated, user, authLoading, refreshUser]);
+
+    useEffect(() => {
+        if (!didInitActiveRef.current) {
+            didInitActiveRef.current = true;
+            const initial = activeCount || 0;
+            setDisplayActive(initial);
+            displayActiveRef.current = initial;
+            return;
+        }
+
+        if (typeof activeCount !== 'number') return;
+
+        const from = displayActiveRef.current;
+        const to = activeCount;
+        if (from === to) return;
+
+        const direction = Math.sign(to - from);
+        const delay = Math.max(40, Math.min(120, 900 / Math.abs(to - from)));
+
+        let timer: number = window.setInterval(() => {
+            setDisplayActive((prev) => {
+                const next = prev + direction;
+                displayActiveRef.current = next;
+                if (next === to) {
+                    clearInterval(timer);
+                }
+                return next;
+            });
+        }, delay);
+
+        return () => clearInterval(timer);
+    }, [activeCount]);
+
+    useEffect(() => {
+        if (!chatListRef.current) return;
+        chatListRef.current.scrollTop = chatListRef.current.scrollHeight;
+    }, [visibleMessages]);
+
+    useEffect(() => {
+        const missingIds = Array.from(new Set(messages.map(m => m.from)))
+            .filter(Boolean)
+            .filter(id => !(id in nameMap));
+
+        if (missingIds.length === 0) return;
+
+        let cancelled = false;
+
+        (async () => {
+            try {
+                const results = await Promise.all(
+                    missingIds.map(async (id) => {
+                        try {
+                            const principal = Principal.fromText(id);
+                            const u = await canisterService.getUserByPrincipal(principal);
+                            const display =
+                                String(u?.name || '').trim() ||
+                                String(u?.username || '').trim() ||
+                                'Unknown User';
+                            return [id, display] as const;
+                        } catch {
+                            return [id, 'Unknown User'] as const;
+                        }
+                    })
+                );
+
+                if (!cancelled) {
+                    setNameMap(prev => {
+                        const next = { ...prev };
+                        for (const [id, display] of results) {
+                            if (!next[id]) next[id] = display;
+                        }
+                        return next;
+                    });
+                }
+            } catch { }
+        })();
+
+        return () => { cancelled = true; };
+    }, [messages, nameMap]);
+
+    useEffect(() => {
+        if (principalId && selfDisplayName) {
+            setNameMap(prev => (prev[principalId] ? prev : { ...prev, [principalId]: selfDisplayName }));
+        }
+    }, [principalId, selfDisplayName]);
 
     // Show loading state
     if (authLoading) {
@@ -907,6 +1034,104 @@ const Dashboard: React.FC = () => {
                             animate={{ opacity: 1, x: 0 }}
                             transition={{ duration: 0.6, delay: 0.3 }}
                         >
+                            {/* Global Chat */}
+                            <Card id="global-chat" className="bg-gray-900/50 border-lime-400/20 backdrop-blur-md">
+                                <CardHeader>
+                                    <div className="flex items-center space-x-3">
+                                        <div className="w-8 h-8 bg-lime-400/20 rounded-lg flex items-center justify-center">
+                                            <Globe className="h-5 w-5 text-lime-400" />
+                                        </div>
+                                        <div>
+                                            <CardTitle className="text-lg text-white">Global Chat</CardTitle>
+                                            <p className="text-gray-400 text-xs">Everyone can see your message</p>
+                                        </div>
+                                    </div>
+                                </CardHeader>
+
+                                <CardContent className="p-4 relative">
+                                    <div className="space-y-3">
+                                        <div
+                                            ref={chatListRef}
+                                            className="h-56 overflow-y-auto bg-gray-800/30 border border-gray-700/30 rounded-lg p-2 scrollbar-hidden cursor-target"
+                                        >
+                                            {messages.length === 0 && (
+                                                <p className="text-xs text-gray-500">No messages yet...</p>
+                                            )}
+
+                                            {visibleMessages.length > 0 && (
+                                                <div className="flex flex-col gap-2">
+                                                    {visibleMessages.map((m) => {
+                                                        const isSelf = m.self;
+                                                        const displayName = isSelf ? selfDisplayName : nameMap[m.from];
+                                                        if (!displayName) return null;
+
+                                                        return (
+                                                            <div key={m.id} className={cn("flex w-full", isSelf ? "justify-end" : "justify-start")}>
+                                                                <div
+                                                                    className={cn(
+                                                                        "max-w-[85%] rounded-lg px-3 py-2 border shadow-sm cursor-target",
+                                                                        isSelf
+                                                                            ? "bg-lime-400/20 border-lime-400/30 text-lime-100"
+                                                                            : "bg-gray-700/50 border-gray-600/50 text-gray-100"
+                                                                    )}
+                                                                >
+                                                                    <div
+                                                                        className={cn(
+                                                                            "text-[11px] mb-1",
+                                                                            isSelf ? "text-right text-lime-300/80" : "text-gray-400"
+                                                                        )}
+                                                                    >
+                                                                        <span className={isSelf ? "font-medium" : ""}>
+                                                                            {displayName}
+                                                                        </span>
+                                                                        <span className="ml-2">{new Date(m.ts).toLocaleTimeString()}</span>
+                                                                    </div>
+                                                                    <div className="text-sm break-words leading-relaxed">{m.text}</div>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        <div className="flex gap-2">
+                                            <Input
+                                                value={chatInput}
+                                                onChange={(e) => setChatInput(e.target.value)}
+                                                placeholder={
+                                                    !isPeerReady
+                                                        ? "Waiting for P2P connection..."
+                                                        : !allNamesReady
+                                                            ? "Resolving participant names..."
+                                                            : "Type a message and press Enter..."
+                                                }
+                                                className="bg-gray-800/50 border-gray-700 text-white cursor-target"
+                                                onKeyDown={(e) => {
+                                                    if (e.key === 'Enter' && chatInput.trim() && isPeerReady && allNamesReady) {
+                                                        sendChat(chatInput);
+                                                        setChatInput('');
+                                                    }
+                                                }}
+                                                disabled={!isPeerReady || !allNamesReady}
+                                            />
+                                            <Button
+                                                className="bg-lime-400 text-black hover:bg-lime-500 cursor-target"
+                                                onClick={() => {
+                                                    if (chatInput.trim() && isPeerReady && allNamesReady) {
+                                                        sendChat(chatInput);
+                                                        setChatInput('');
+                                                    }
+                                                }}
+                                                disabled={!isPeerReady || !allNamesReady || !chatInput.trim()}
+                                            >
+                                                Send
+                                            </Button>
+                                        </div>
+                                    </div>
+                                </CardContent>
+                            </Card>
+
                             {/* Live Activity */}
                             <Card className="bg-gray-900/50 border-lime-400/20 backdrop-blur-md">
                                 <CardHeader>
@@ -1010,21 +1235,34 @@ const Dashboard: React.FC = () => {
                                         <div className="flex items-center justify-between">
                                             <span className="text-sm text-gray-400">Connection</span>
                                             <div className="flex items-center space-x-2">
-                                                <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
-                                                <span className="text-sm text-green-400 font-medium">Excellent</span>
+                                                <div className={`w-2 h-2 rounded-full ${isPeerReady ? 'bg-green-400 animate-pulse' : 'bg-yellow-400'}`}></div>
+                                                <span className={`text-sm font-medium ${isPeerReady ? 'text-green-400' : 'text-yellow-400'}`}>
+                                                    {isPeerReady ? 'Excellent' : (statusText === 'error' ? 'Error' : 'Connecting')}
+                                                </span>
                                             </div>
                                         </div>
+
                                         <div className="flex items-center justify-between">
                                             <span className="text-sm text-gray-400">Active Users</span>
-                                            <span className="text-sm text-white font-medium">1,247</span>
+                                            <motion.span
+                                                key={displayActive}
+                                                initial={{ scale: 0.9, opacity: 0.6 }}
+                                                animate={{ scale: 1, opacity: 1 }}
+                                                transition={{ type: 'spring', stiffness: 300, damping: 18 }}
+                                                className="text-sm text-white font-medium tabular-nums"
+                                            >
+                                                {displayActive > 0 ? displayActive : '-'}
+                                            </motion.span>
                                         </div>
+
                                         <div className="flex items-center justify-between">
                                             <span className="text-sm text-gray-400">Active Rooms</span>
-                                            <span className="text-sm text-white font-medium">89</span>
+                                            <span className="text-sm text-white font-medium">-</span>
                                         </div>
+
                                         <div className="flex items-center justify-between">
                                             <span className="text-sm text-gray-400">Latency</span>
-                                            <span className="text-sm text-white font-medium">10ms</span>
+                                            <span className="text-sm text-white font-medium">-</span>
                                         </div>
                                     </div>
                                 </CardContent>

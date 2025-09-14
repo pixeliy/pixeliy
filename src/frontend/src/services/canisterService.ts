@@ -33,6 +33,7 @@ export interface BackendActor {
 
     // Online users functions
     registerOnline(): Promise<void>;
+    unregisterOnline(): Promise<void>;
     getOnlineUsers(): Promise<Principal[]>;
     getTotalOnlineUsers(): Promise<number>;
 }
@@ -316,6 +317,11 @@ class CanisterService {
     async registerOnline(): Promise<void> {
         const actor = this.ensureActor();
         return await actor.registerOnline();
+    }
+
+    async unregisterOnline(): Promise<void> {
+        const actor = this.ensureActor();
+        return await actor.unregisterOnline();
     }
 
     async getOnlineUsers(): Promise<Principal[]> {

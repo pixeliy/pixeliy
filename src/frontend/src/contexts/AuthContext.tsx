@@ -243,6 +243,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
     const logout = useCallback(async () => {
         try {
+            try { await canisterService.unregisterOnline(); } catch {}
             if (authClient) {
                 await authClient.logout();
             }
