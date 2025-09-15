@@ -46,6 +46,16 @@
         }
       },
       "frontend": {}
+    },
+    "pixeliy_index":{
+      "type": "custom",
+      "candid": "src/token/index-ng.did",
+      "wasm" : "src/token/ic-icrc1-index-ng.wasm.gz"
+    },
+    "pixeliy_ledger": {
+      "type": "custom",
+      "candid": "src/token/ledger.did",
+      "wasm" : "src/token/ic-icrc1-ledger.wasm.gz"
     }
   },
   "defaults": {
